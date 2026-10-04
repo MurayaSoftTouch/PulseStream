@@ -1,10 +1,11 @@
 //! Liveness and readiness endpoints.
 //!
-//! Readiness reports only dependencies that exist. In M1 that is the
-//! in-memory processing pipeline. PostgreSQL checks are added when the event
-//! pipeline first uses the database (M2).
+//! - `/health/live`: the process is alive. It stays `200` during a database outage.
+//! - `/health/ready`: the service can durably accept events, proven by a
+//!   lightweight PostgreSQL round trip. `503` when the database is unreachable.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
@@ -14,6 +15,10 @@ use tracing::warn;
 
 use crate::SERVICE;
 use crate::app::AppState;
+
+/// Upper bound on the readiness database check, independent of pool settings,
+/// so probes never hang.
+pub const READINESS_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Serialize)]
 pub struct Liveness {
@@ -37,19 +42,28 @@ pub async fn live() -> Json<Liveness> {
 }
 
 pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Readiness>) {
-    let processing_ready = state.admission.is_available();
+    let database_ready = match tokio::time::timeout(READINESS_TIMEOUT, state.store.ping()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(err)) => {
+            warn!(check = "database", error = %err, "readiness check failed");
+            false
+        }
+        Err(_) => {
+            warn!(check = "database", "readiness check timed out");
+            false
+        }
+    };
     let checks = BTreeMap::from([(
-        "processing",
-        if processing_ready {
+        "database",
+        if database_ready {
             "ready"
         } else {
             "unavailable"
         },
     )]);
-    let (code, status) = if processing_ready {
+    let (code, status) = if database_ready {
         (StatusCode::OK, "ok")
     } else {
-        warn!(check = "processing", "readiness check failed");
         (StatusCode::SERVICE_UNAVAILABLE, "unavailable")
     };
     (
@@ -68,15 +82,23 @@ mod tests {
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
-    use pulsestream_core::config::PipelineConfig;
-    use pulsestream_worker::pipeline::{AcknowledgeProcessor, Admission, Pipeline};
+    use pulsestream_core::config::{DatabaseConfig, DatabaseUrl};
+    use pulsestream_store::Store;
+    use pulsestream_store::testing::TestDatabase;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
     use crate::app::{AppState, router};
 
-    async fn get(admission: Admission, path: &str) -> (StatusCode, Option<String>, Value) {
-        let response = router(AppState { admission })
+    fn unreachable_store() -> Store {
+        let url = DatabaseUrl::parse("postgres://u:p@127.0.0.1:1/unreachable").unwrap();
+        let mut config = DatabaseConfig::with_url(url);
+        config.acquire_timeout = Duration::from_millis(200);
+        Store::connect_lazy(&config, "test").unwrap()
+    }
+
+    async fn get(store: Store, path: &str) -> (StatusCode, Option<String>, Value) {
+        let response = router(AppState { store })
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -94,48 +116,43 @@ mod tests {
         (status, content_type, json)
     }
 
-    fn start() -> Pipeline {
-        Pipeline::start(&PipelineConfig::default(), AcknowledgeProcessor)
-    }
-
     #[tokio::test]
-    async fn live_reports_ok() {
-        let (status, content_type, body) = get(start().admission(), "/health/live").await;
+    async fn live_is_ok_even_when_database_is_down() {
+        let (status, content_type, body) = get(unreachable_store(), "/health/live").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type.as_deref(), Some("application/json"));
         assert_eq!(body, json!({"status": "ok", "service": "pulsestream-api"}));
     }
 
     #[tokio::test]
-    async fn ready_reports_processing_ready() {
-        let (status, _, body) = get(start().admission(), "/health/ready").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body,
-            json!({"status": "ok", "service": "pulsestream-api", "checks": {"processing": "ready"}})
-        );
-    }
-
-    #[tokio::test]
-    async fn ready_reports_unavailable_after_pipeline_stops() {
-        let pipeline = start();
-        let admission = pipeline.admission();
-        pipeline.shutdown(Duration::from_secs(5)).await;
-        let (status, _, body) = get(admission, "/health/ready").await;
+    async fn ready_is_503_when_database_is_down() {
+        let (status, _, body) = get(unreachable_store(), "/health/ready").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             body,
             json!({
                 "status": "unavailable",
                 "service": "pulsestream-api",
-                "checks": {"processing": "unavailable"}
+                "checks": {"database": "unavailable"}
             })
         );
     }
 
     #[tokio::test]
     async fn unknown_routes_are_not_found() {
-        let (status, _, _) = get(start().admission(), "/health").await;
+        let (status, _, _) = get(unreachable_store(), "/health").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL (PULSESTREAM_TEST_DATABASE_URL)"]
+    async fn ready_reports_database_ready() {
+        let db = TestDatabase::create().await;
+        let (status, _, body) = get(db.store.clone(), "/health/ready").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"status": "ok", "service": "pulsestream-api", "checks": {"database": "ready"}})
+        );
     }
 }

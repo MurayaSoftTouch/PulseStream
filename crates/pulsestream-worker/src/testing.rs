@@ -1,13 +1,14 @@
 //! Deterministic test processors (enabled for tests and by the `test-util`
 //! feature). Not used in production builds.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pulsestream_core::event::{Event, EventId};
 use tokio::sync::Semaphore;
 
-use crate::pipeline::{EventProcessor, ProcessError};
+use crate::processor::{EventProcessor, ProcessError};
 
 /// A valid event for tests.
 pub fn event() -> Event {
@@ -33,6 +34,10 @@ struct Inner {
     max_observed: AtomicUsize,
     completed: AtomicUsize,
     seen: Mutex<Vec<EventId>>,
+    /// Events currently inside `process`, to detect the same event being
+    /// processed twice at once (for example, by two workers).
+    active: Mutex<HashSet<EventId>>,
+    overlaps: AtomicUsize,
 }
 
 impl GatedProcessor {
@@ -56,6 +61,8 @@ impl GatedProcessor {
                 max_observed: AtomicUsize::new(0),
                 completed: AtomicUsize::new(0),
                 seen: Mutex::new(Vec::new()),
+                active: Mutex::new(HashSet::new()),
+                overlaps: AtomicUsize::new(0),
             }),
         }
     }
@@ -94,6 +101,11 @@ impl GatedProcessor {
         self.inner.completed.load(Ordering::Acquire)
     }
 
+    /// Times an event started while the same event was already being processed.
+    pub fn overlaps(&self) -> usize {
+        self.inner.overlaps.load(Ordering::Acquire)
+    }
+
     /// Event IDs in the order processing started.
     pub fn seen(&self) -> Vec<EventId> {
         self.inner.seen.lock().expect("not poisoned").clone()
@@ -112,6 +124,9 @@ impl EventProcessor for GatedProcessor {
         let now = inner.current.fetch_add(1, Ordering::AcqRel) + 1;
         inner.max_observed.fetch_max(now, Ordering::AcqRel);
         inner.seen.lock().expect("not poisoned").push(event.id);
+        if !inner.active.lock().expect("not poisoned").insert(event.id) {
+            inner.overlaps.fetch_add(1, Ordering::AcqRel);
+        }
         inner.started.fetch_add(1, Ordering::AcqRel);
         inner.started_signal.add_permits(1);
 
@@ -120,6 +135,7 @@ impl EventProcessor for GatedProcessor {
             None => tokio::task::yield_now().await,
         }
 
+        inner.active.lock().expect("not poisoned").remove(&event.id);
         inner.current.fetch_sub(1, Ordering::AcqRel);
         inner.completed.fetch_add(1, Ordering::AcqRel);
         Ok(())

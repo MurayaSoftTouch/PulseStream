@@ -40,6 +40,19 @@ impl EventId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
+    /// Parses the canonical hyphenated UUID form used in API paths.
+    pub fn parse(value: &str) -> Option<Self> {
+        Uuid::try_parse(value).ok().map(Self)
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
 }
 
 impl Default for EventId {
@@ -51,6 +64,76 @@ impl Default for EventId {
 impl fmt::Display for EventId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+/// Identity of one worker process instance (UUID v4, generated at startup).
+/// Stored as the owner of the events it claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WorkerId(Uuid);
+
+impl WorkerId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for WorkerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for WorkerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Durable lifecycle state of an event (M2).
+///
+/// ```text
+/// PENDING ──claim──▶ PROCESSING ──complete (owner only)──▶ PROCESSED
+///                        │
+///                        └── lease expires ──▶ reclaimable by any worker
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventStatus {
+    Pending,
+    Processing,
+    Processed,
+}
+
+impl EventStatus {
+    /// Value stored in the `events.status` column.
+    pub const fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Processing => "PROCESSING",
+            Self::Processed => "PROCESSED",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "PENDING" => Some(Self::Pending),
+            "PROCESSING" => Some(Self::Processing),
+            "PROCESSED" => Some(Self::Processed),
+            _ => None,
+        }
+    }
+
+    /// Stable, lowercase value used in the public API.
+    pub const fn as_api_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Processing => "processing",
+            Self::Processed => "processed",
+        }
     }
 }
 
@@ -110,7 +193,8 @@ pub struct Event {
     pub source: EventSource,
     pub event_type: EventType,
     pub payload: Value,
-    /// Wall-clock (UTC-based) time at which the event was admitted.
+    /// Time the event was accepted. For stored events this is the
+    /// database's commit-time clock (`accepted_at` column).
     pub accepted_at: SystemTime,
 }
 
@@ -184,6 +268,29 @@ mod tests {
                 max: MAX_EVENT_TYPE_CHARS
             }
         );
+    }
+
+    #[test]
+    fn event_ids_parse_from_their_display_form() {
+        let id = EventId::new();
+        assert_eq!(EventId::parse(&id.to_string()), Some(id));
+        assert_eq!(EventId::parse("not-a-uuid"), None);
+        assert_eq!(EventId::parse(""), None);
+    }
+
+    #[test]
+    fn statuses_round_trip_and_have_stable_api_names() {
+        for status in [
+            EventStatus::Pending,
+            EventStatus::Processing,
+            EventStatus::Processed,
+        ] {
+            assert_eq!(EventStatus::from_db_str(status.as_db_str()), Some(status));
+        }
+        assert_eq!(EventStatus::Pending.as_api_str(), "pending");
+        assert_eq!(EventStatus::Processing.as_api_str(), "processing");
+        assert_eq!(EventStatus::Processed.as_api_str(), "processed");
+        assert_eq!(EventStatus::from_db_str("RETRYING"), None);
     }
 
     #[test]

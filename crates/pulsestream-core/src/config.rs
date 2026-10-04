@@ -1,7 +1,8 @@
 //! Environment-based configuration.
 //!
 //! Parsing takes a lookup function instead of reading `std::env` directly so it
-//! can be tested without mutating process-global state.
+//! can be tested without mutating process-global state. A variable that is set
+//! but invalid is always an error; defaults apply only to unset variables.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -12,22 +13,35 @@ use thiserror::Error;
 
 pub const API_BIND_VAR: &str = "PULSESTREAM_API_BIND";
 pub const DATABASE_URL_VAR: &str = "DATABASE_URL";
-pub const QUEUE_CAPACITY_VAR: &str = "PULSESTREAM_QUEUE_CAPACITY";
+pub const DB_MAX_CONNECTIONS_VAR: &str = "PULSESTREAM_DB_MAX_CONNECTIONS";
+pub const DB_ACQUIRE_TIMEOUT_MS_VAR: &str = "PULSESTREAM_DB_ACQUIRE_TIMEOUT_MS";
+pub const MIGRATE_ON_START_VAR: &str = "PULSESTREAM_MIGRATE_ON_START";
 pub const WORKER_CONCURRENCY_VAR: &str = "PULSESTREAM_WORKER_CONCURRENCY";
+pub const POLL_INTERVAL_MS_VAR: &str = "PULSESTREAM_POLL_INTERVAL_MS";
+pub const PROCESSING_LEASE_MS_VAR: &str = "PULSESTREAM_PROCESSING_LEASE_MS";
 pub const SHUTDOWN_TIMEOUT_MS_VAR: &str = "PULSESTREAM_SHUTDOWN_TIMEOUT_MS";
-
-pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
-pub const QUEUE_CAPACITY_RANGE: RangeInclusive<u64> = 1..=65_536;
-pub const DEFAULT_WORKER_CONCURRENCY: usize = 4;
-pub const WORKER_CONCURRENCY_RANGE: RangeInclusive<u64> = 1..=64;
-pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
-pub const SHUTDOWN_TIMEOUT_MS_RANGE: RangeInclusive<u64> = 1..=300_000;
 
 /// Loopback-only default so an unconfigured process is never exposed publicly.
 pub const DEFAULT_API_BIND: &str = "127.0.0.1:8088";
 
+pub const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
+pub const DB_MAX_CONNECTIONS_RANGE: RangeInclusive<u64> = 1..=50;
+pub const DEFAULT_DB_ACQUIRE_TIMEOUT_MS: u64 = 3_000;
+pub const DB_ACQUIRE_TIMEOUT_MS_RANGE: RangeInclusive<u64> = 100..=60_000;
+pub const DEFAULT_WORKER_CONCURRENCY: usize = 4;
+pub const WORKER_CONCURRENCY_RANGE: RangeInclusive<u64> = 1..=64;
+pub const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
+pub const POLL_INTERVAL_MS_RANGE: RangeInclusive<u64> = 10..=60_000;
+pub const DEFAULT_PROCESSING_LEASE_MS: u64 = 30_000;
+pub const PROCESSING_LEASE_MS_RANGE: RangeInclusive<u64> = 1_000..=3_600_000;
+pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
+pub const SHUTDOWN_TIMEOUT_MS_RANGE: RangeInclusive<u64> = 1..=300_000;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
+    #[error("{var} must be set")]
+    Missing { var: &'static str },
+
     #[error("{var} must be a socket address such as 127.0.0.1:8088, got {value:?}")]
     InvalidBindAddress { var: &'static str, value: String },
 
@@ -47,6 +61,9 @@ pub enum ConfigError {
         min: u64,
         max: u64,
     },
+
+    #[error("{var} must be `true` or `false`, got {value:?}")]
+    InvalidBool { var: &'static str, value: String },
 }
 
 /// A validated PostgreSQL connection URL.
@@ -87,18 +104,6 @@ impl fmt::Debug for DatabaseUrl {
     }
 }
 
-/// Reads and validates `DATABASE_URL` when set.
-///
-/// Optional until M2: validated so mistakes surface early, but no process
-/// connects to PostgreSQL yet.
-pub fn database_url(
-    lookup: &impl Fn(&str) -> Option<String>,
-) -> Result<Option<DatabaseUrl>, ConfigError> {
-    lookup(DATABASE_URL_VAR)
-        .map(|raw| DatabaseUrl::parse(&raw))
-        .transpose()
-}
-
 /// Reads `PULSESTREAM_API_BIND`, defaulting to [`DEFAULT_API_BIND`].
 pub fn api_bind(lookup: &impl Fn(&str) -> Option<String>) -> Result<SocketAddr, ConfigError> {
     let raw = lookup(API_BIND_VAR).unwrap_or_else(|| DEFAULT_API_BIND.to_owned());
@@ -110,10 +115,6 @@ pub fn api_bind(lookup: &impl Fn(&str) -> Option<String>) -> Result<SocketAddr, 
         })
 }
 
-/// Reads an integer setting, applying `default` only when the variable is unset.
-///
-/// A value that is set but invalid or out of range is an error; it is never
-/// silently replaced by the default.
 fn bounded_integer(
     lookup: &impl Fn(&str) -> Option<String>,
     var: &'static str,
@@ -134,71 +135,140 @@ fn bounded_integer(
     }
 }
 
-/// Limits of the bounded in-memory event pipeline.
-///
-/// At most `queue_capacity + worker_concurrency` events are held in memory at
-/// any time: `queue_capacity` waiting for a worker and `worker_concurrency`
-/// being processed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PipelineConfig {
-    pub queue_capacity: usize,
-    pub worker_concurrency: usize,
-    /// How long shutdown waits for admitted events to drain before abandoning them.
-    pub shutdown_timeout: Duration,
+fn millis(
+    lookup: &impl Fn(&str) -> Option<String>,
+    var: &'static str,
+    default: u64,
+    range: RangeInclusive<u64>,
+) -> Result<Duration, ConfigError> {
+    bounded_integer(lookup, var, default, range).map(Duration::from_millis)
 }
 
-impl PipelineConfig {
+fn boolean(
+    lookup: &impl Fn(&str) -> Option<String>,
+    var: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    match lookup(var).as_deref().map(str::trim) {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(ConfigError::InvalidBool {
+            var,
+            value: other.to_owned(),
+        }),
+    }
+}
+
+/// PostgreSQL connection settings shared by the API and worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseConfig {
+    pub url: DatabaseUrl,
+    /// Upper bound on pooled connections per process.
+    pub max_connections: u32,
+    /// How long a request waits for a pooled connection, including connecting.
+    pub acquire_timeout: Duration,
+    /// Apply embedded migrations at startup.
+    pub migrate_on_start: bool,
+}
+
+impl DatabaseConfig {
     pub fn from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        // The ranges fit in usize on every supported (>= 32-bit) target.
-        let queue_capacity = bounded_integer(
-            lookup,
-            QUEUE_CAPACITY_VAR,
-            DEFAULT_QUEUE_CAPACITY as u64,
-            QUEUE_CAPACITY_RANGE,
-        )? as usize;
-        let worker_concurrency = bounded_integer(
-            lookup,
-            WORKER_CONCURRENCY_VAR,
-            DEFAULT_WORKER_CONCURRENCY as u64,
-            WORKER_CONCURRENCY_RANGE,
-        )? as usize;
-        let shutdown_timeout_ms = bounded_integer(
-            lookup,
-            SHUTDOWN_TIMEOUT_MS_VAR,
-            DEFAULT_SHUTDOWN_TIMEOUT_MS,
-            SHUTDOWN_TIMEOUT_MS_RANGE,
-        )?;
+        let raw = lookup(DATABASE_URL_VAR).ok_or(ConfigError::Missing {
+            var: DATABASE_URL_VAR,
+        })?;
         Ok(Self {
-            queue_capacity,
-            worker_concurrency,
-            shutdown_timeout: Duration::from_millis(shutdown_timeout_ms),
+            url: DatabaseUrl::parse(&raw)?,
+            max_connections: bounded_integer(
+                lookup,
+                DB_MAX_CONNECTIONS_VAR,
+                u64::from(DEFAULT_DB_MAX_CONNECTIONS),
+                DB_MAX_CONNECTIONS_RANGE,
+            )? as u32,
+            acquire_timeout: millis(
+                lookup,
+                DB_ACQUIRE_TIMEOUT_MS_VAR,
+                DEFAULT_DB_ACQUIRE_TIMEOUT_MS,
+                DB_ACQUIRE_TIMEOUT_MS_RANGE,
+            )?,
+            migrate_on_start: boolean(lookup, MIGRATE_ON_START_VAR, true)?,
         })
     }
 
-    /// Upper bound on events held in memory by the pipeline.
-    pub fn max_occupancy(&self) -> usize {
-        self.queue_capacity + self.worker_concurrency
+    /// Settings for a given URL with every other value at its default.
+    pub fn with_url(url: DatabaseUrl) -> Self {
+        Self {
+            url,
+            max_connections: DEFAULT_DB_MAX_CONNECTIONS,
+            acquire_timeout: Duration::from_millis(DEFAULT_DB_ACQUIRE_TIMEOUT_MS),
+            migrate_on_start: true,
+        }
     }
 }
 
-impl Default for PipelineConfig {
+/// Limits and timings of the worker's claim/process loop.
+///
+/// At most `concurrency` events are claimed and processed at once. The
+/// worker never prefetches beyond its free capacity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRuntimeConfig {
+    pub concurrency: usize,
+    /// Sleep between claim attempts when no work is available.
+    pub poll_interval: Duration,
+    /// How long a claim is exclusively owned before another worker may reclaim it.
+    pub lease: Duration,
+    /// How long shutdown waits for active processing to finish.
+    pub shutdown_timeout: Duration,
+}
+
+impl WorkerRuntimeConfig {
+    pub fn from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        Ok(Self {
+            // The range fits in usize on every supported (>= 32-bit) target.
+            concurrency: bounded_integer(
+                lookup,
+                WORKER_CONCURRENCY_VAR,
+                DEFAULT_WORKER_CONCURRENCY as u64,
+                WORKER_CONCURRENCY_RANGE,
+            )? as usize,
+            poll_interval: millis(
+                lookup,
+                POLL_INTERVAL_MS_VAR,
+                DEFAULT_POLL_INTERVAL_MS,
+                POLL_INTERVAL_MS_RANGE,
+            )?,
+            lease: millis(
+                lookup,
+                PROCESSING_LEASE_MS_VAR,
+                DEFAULT_PROCESSING_LEASE_MS,
+                PROCESSING_LEASE_MS_RANGE,
+            )?,
+            shutdown_timeout: millis(
+                lookup,
+                SHUTDOWN_TIMEOUT_MS_VAR,
+                DEFAULT_SHUTDOWN_TIMEOUT_MS,
+                SHUTDOWN_TIMEOUT_MS_RANGE,
+            )?,
+        })
+    }
+}
+
+impl Default for WorkerRuntimeConfig {
     fn default() -> Self {
         Self {
-            queue_capacity: DEFAULT_QUEUE_CAPACITY,
-            worker_concurrency: DEFAULT_WORKER_CONCURRENCY,
+            concurrency: DEFAULT_WORKER_CONCURRENCY,
+            poll_interval: Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
+            lease: Duration::from_millis(DEFAULT_PROCESSING_LEASE_MS),
             shutdown_timeout: Duration::from_millis(DEFAULT_SHUTDOWN_TIMEOUT_MS),
         }
     }
 }
 
 /// Configuration for the `pulsestream-api` process.
-///
-/// In M1 the API process also hosts the in-memory processing pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiConfig {
     pub bind: SocketAddr,
-    pub database_url: Option<DatabaseUrl>,
-    pub pipeline: PipelineConfig,
+    pub database: DatabaseConfig,
 }
 
 impl ApiConfig {
@@ -209,8 +279,7 @@ impl ApiConfig {
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         Ok(Self {
             bind: api_bind(&lookup)?,
-            database_url: database_url(&lookup)?,
-            pipeline: PipelineConfig::from_lookup(&lookup)?,
+            database: DatabaseConfig::from_lookup(&lookup)?,
         })
     }
 }
@@ -218,7 +287,8 @@ impl ApiConfig {
 /// Configuration for the `pulsestream-worker` process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerConfig {
-    pub database_url: Option<DatabaseUrl>,
+    pub database: DatabaseConfig,
+    pub runtime: WorkerRuntimeConfig,
 }
 
 impl WorkerConfig {
@@ -228,7 +298,8 @@ impl WorkerConfig {
 
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         Ok(Self {
-            database_url: database_url(&lookup)?,
+            database: DatabaseConfig::from_lookup(&lookup)?,
+            runtime: WorkerRuntimeConfig::from_lookup(&lookup)?,
         })
     }
 }
@@ -238,6 +309,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    const URL: &str = "postgres://user:pw@127.0.0.1:55432/pulsestream";
+
     fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = vars
             .iter()
@@ -246,51 +319,75 @@ mod tests {
         move |key| map.get(key).cloned()
     }
 
-    fn config(vars: &[(&str, &str)]) -> Result<ApiConfig, ConfigError> {
-        ApiConfig::from_lookup(env(vars))
+    fn api(vars: &[(&str, &str)]) -> Result<ApiConfig, ConfigError> {
+        let mut all = vec![(DATABASE_URL_VAR, URL)];
+        all.extend_from_slice(vars);
+        ApiConfig::from_lookup(env(&all))
+    }
+
+    fn worker(vars: &[(&str, &str)]) -> Result<WorkerConfig, ConfigError> {
+        let mut all = vec![(DATABASE_URL_VAR, URL)];
+        all.extend_from_slice(vars);
+        WorkerConfig::from_lookup(env(&all))
     }
 
     #[test]
-    fn defaults_to_loopback_bind_without_database() {
-        let cfg = config(&[]).unwrap();
+    fn database_url_is_required() {
+        let missing = ConfigError::Missing {
+            var: DATABASE_URL_VAR,
+        };
+        assert_eq!(ApiConfig::from_lookup(env(&[])).unwrap_err(), missing);
+        assert_eq!(WorkerConfig::from_lookup(env(&[])).unwrap_err(), missing);
+    }
+
+    #[test]
+    fn defaults_are_conservative() {
+        let cfg = api(&[]).unwrap();
         assert_eq!(cfg.bind, "127.0.0.1:8088".parse().unwrap());
         assert!(cfg.bind.ip().is_loopback());
-        assert_eq!(cfg.database_url, None);
+        assert_eq!(cfg.database.max_connections, 10);
+        assert_eq!(cfg.database.acquire_timeout, Duration::from_secs(3));
+        assert!(cfg.database.migrate_on_start);
+
+        let runtime = worker(&[]).unwrap().runtime;
+        assert_eq!(runtime, WorkerRuntimeConfig::default());
+        assert_eq!(runtime.concurrency, 4);
+        assert_eq!(runtime.poll_interval, Duration::from_millis(250));
+        assert_eq!(runtime.lease, Duration::from_secs(30));
+        assert_eq!(runtime.shutdown_timeout, Duration::from_secs(10));
     }
 
     #[test]
     fn rejects_invalid_bind_address() {
-        let err = config(&[(API_BIND_VAR, "localhost")]).unwrap_err();
+        let err = api(&[(API_BIND_VAR, "localhost")]).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidBindAddress { .. }));
     }
 
     #[test]
     fn accepts_postgres_urls() {
-        for url in [
-            "postgres://user:pw@127.0.0.1:55432/pulsestream",
-            "postgresql://db.internal/pulsestream?sslmode=require",
-        ] {
-            let cfg = config(&[(DATABASE_URL_VAR, url)]).unwrap();
-            assert_eq!(cfg.database_url.unwrap().expose(), url);
+        for url in [URL, "postgresql://db.internal/pulsestream?sslmode=require"] {
+            let cfg = DatabaseConfig::from_lookup(&env(&[(DATABASE_URL_VAR, url)])).unwrap();
+            assert_eq!(cfg.url.expose(), url);
         }
     }
 
     #[test]
     fn rejects_malformed_database_urls() {
+        let parse = |url| DatabaseConfig::from_lookup(&env(&[(DATABASE_URL_VAR, url)]));
         assert_eq!(
-            config(&[(DATABASE_URL_VAR, "  ")]).unwrap_err(),
+            parse("  ").unwrap_err(),
             ConfigError::Empty {
                 var: DATABASE_URL_VAR
             }
         );
         assert_eq!(
-            config(&[(DATABASE_URL_VAR, "mysql://h/db")]).unwrap_err(),
+            parse("mysql://h/db").unwrap_err(),
             ConfigError::UnsupportedDatabaseScheme {
                 var: DATABASE_URL_VAR
             }
         );
         assert_eq!(
-            config(&[(DATABASE_URL_VAR, "postgres://user:pw@:5432/db")]).unwrap_err(),
+            parse("postgres://user:pw@:5432/db").unwrap_err(),
             ConfigError::MissingDatabaseHost {
                 var: DATABASE_URL_VAR
             }
@@ -298,89 +395,61 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_defaults_are_conservative() {
-        let cfg = config(&[]).unwrap().pipeline;
-        assert_eq!(cfg, PipelineConfig::default());
-        assert_eq!(cfg.queue_capacity, 256);
-        assert_eq!(cfg.worker_concurrency, 4);
-        assert_eq!(cfg.shutdown_timeout, Duration::from_secs(10));
-        assert_eq!(cfg.max_occupancy(), 260);
-    }
-
-    #[test]
-    fn accepts_pipeline_limits_at_range_bounds() {
-        let cfg = config(&[
-            (QUEUE_CAPACITY_VAR, "65536"),
+    fn accepts_limits_at_range_bounds() {
+        let cfg = worker(&[
+            (DB_MAX_CONNECTIONS_VAR, "50"),
+            (DB_ACQUIRE_TIMEOUT_MS_VAR, "100"),
+            (MIGRATE_ON_START_VAR, "false"),
             (WORKER_CONCURRENCY_VAR, "1"),
-            (SHUTDOWN_TIMEOUT_MS_VAR, " 300000 "),
+            (POLL_INTERVAL_MS_VAR, "60000"),
+            (PROCESSING_LEASE_MS_VAR, " 1000 "),
+            (SHUTDOWN_TIMEOUT_MS_VAR, "300000"),
         ])
-        .unwrap()
-        .pipeline;
-        assert_eq!(cfg.queue_capacity, 65_536);
-        assert_eq!(cfg.worker_concurrency, 1);
-        assert_eq!(cfg.shutdown_timeout, Duration::from_secs(300));
+        .unwrap();
+        assert_eq!(cfg.database.max_connections, 50);
+        assert_eq!(cfg.database.acquire_timeout, Duration::from_millis(100));
+        assert!(!cfg.database.migrate_on_start);
+        assert_eq!(cfg.runtime.concurrency, 1);
+        assert_eq!(cfg.runtime.poll_interval, Duration::from_secs(60));
+        assert_eq!(cfg.runtime.lease, Duration::from_secs(1));
+        assert_eq!(cfg.runtime.shutdown_timeout, Duration::from_secs(300));
     }
 
     #[test]
-    fn rejects_invalid_queue_capacity() {
-        for bad in ["0", "65537", "18446744073709551615", "-1", "lots", ""] {
-            let err = config(&[(QUEUE_CAPACITY_VAR, bad)]).unwrap_err();
+    fn rejects_out_of_range_integers() {
+        let cases = [
+            (DB_MAX_CONNECTIONS_VAR, "0"),
+            (DB_MAX_CONNECTIONS_VAR, "51"),
+            (DB_ACQUIRE_TIMEOUT_MS_VAR, "99"),
+            (WORKER_CONCURRENCY_VAR, "0"),
+            (WORKER_CONCURRENCY_VAR, "65"),
+            (WORKER_CONCURRENCY_VAR, "4.5"),
+            (POLL_INTERVAL_MS_VAR, "9"),
+            (PROCESSING_LEASE_MS_VAR, "999"),
+            (PROCESSING_LEASE_MS_VAR, "18446744073709551615"),
+            (SHUTDOWN_TIMEOUT_MS_VAR, "0"),
+            (SHUTDOWN_TIMEOUT_MS_VAR, "-1"),
+            (SHUTDOWN_TIMEOUT_MS_VAR, ""),
+        ];
+        for (var, value) in cases {
+            let err = worker(&[(var, value)]).unwrap_err();
             assert!(
-                matches!(
-                    err,
-                    ConfigError::OutOfRange {
-                        var: QUEUE_CAPACITY_VAR,
-                        ..
-                    }
-                ),
-                "{bad:?} -> {err:?}"
+                matches!(err, ConfigError::OutOfRange { var: v, .. } if v == var),
+                "{var}={value:?} -> {err:?}"
             );
         }
     }
 
     #[test]
-    fn rejects_invalid_worker_concurrency() {
-        for bad in ["0", "65", "4.5"] {
-            let err = config(&[(WORKER_CONCURRENCY_VAR, bad)]).unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    ConfigError::OutOfRange {
-                        var: WORKER_CONCURRENCY_VAR,
-                        ..
-                    }
-                ),
-                "{bad:?} -> {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_invalid_shutdown_timeout() {
-        for bad in ["0", "300001"] {
-            assert!(
-                config(&[(SHUTDOWN_TIMEOUT_MS_VAR, bad)]).is_err(),
-                "{bad:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn worker_ignores_api_bind_but_validates_database_url() {
-        let cfg = WorkerConfig::from_lookup(env(&[(API_BIND_VAR, "not-an-address")])).unwrap();
-        assert_eq!(cfg.database_url, None);
-        assert!(WorkerConfig::from_lookup(env(&[(DATABASE_URL_VAR, "redis://h")])).is_err());
+    fn rejects_non_boolean_migrate_flag() {
+        let err = api(&[(MIGRATE_ON_START_VAR, "yes")]).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidBool { .. }));
     }
 
     #[test]
     fn database_url_never_leaks_credentials() {
-        let url = DatabaseUrl::parse("postgres://user:s3cret@host/db").unwrap();
-        let rendered = format!(
-            "{url:?} {:?}",
-            WorkerConfig {
-                database_url: Some(url.clone()),
-            }
-        );
+        let cfg = worker(&[(DATABASE_URL_VAR, "postgres://user:s3cret@host/db")]).unwrap();
+        let rendered = format!("{cfg:?}");
         assert!(!rendered.contains("s3cret"), "{rendered}");
     }
 }

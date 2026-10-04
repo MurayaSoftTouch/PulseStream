@@ -1,19 +1,22 @@
 //! PulseStream worker process.
 //!
-//! This binary has no event source yet. In M1 the bounded pipeline (see the
-//! `pipeline` module of this crate's library) runs inside the API process,
-//! because admission is in-memory. From M2 this process will consume durably
-//! accepted events from PostgreSQL. Until then it idles (no polling, no busy
-//! loop) until asked to shut down.
+//! Claims durably accepted events from PostgreSQL and processes them with
+//! bounded concurrency. Every process gets a fresh worker ID, which it records
+//! as the owner of its claims. On shutdown it stops claiming, lets active
+//! events finish within the timeout, and leaves anything unfinished to lease
+//! recovery.
 
 mod shutdown;
 mod telemetry;
 
-use std::future::Future;
 use std::process::ExitCode;
 
 use pulsestream_core::ServiceName;
 use pulsestream_core::config::WorkerConfig;
+use pulsestream_core::event::WorkerId;
+use pulsestream_store::Store;
+use pulsestream_worker::processor::AcknowledgeProcessor;
+use pulsestream_worker::runtime;
 use tracing::{error, info};
 
 const SERVICE: ServiceName = ServiceName::Worker;
@@ -29,43 +32,43 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let owner = WorkerId::new();
     info!(
         service = %SERVICE,
         version = env!("CARGO_PKG_VERSION"),
-        database_configured = config.database_url.is_some(),
+        worker_id = %owner,
+        max_connections = config.database.max_connections,
         "starting"
     );
 
-    run(shutdown::signal()).await;
-    info!(service = %SERVICE, "shutdown complete");
-    ExitCode::SUCCESS
-}
+    let store = match Store::connect_lazy(&config.database, SERVICE.as_str()) {
+        Ok(store) => store,
+        Err(err) => {
+            error!(service = %SERVICE, error = %err, "invalid database configuration");
+            return ExitCode::FAILURE;
+        }
+    };
+    if config.database.migrate_on_start {
+        if let Err(err) = store.migrate().await {
+            error!(service = %SERVICE, error = %err, "database migration failed");
+            return ExitCode::FAILURE;
+        }
+        info!(service = %SERVICE, "database migrations applied");
+    }
 
-/// Runs the worker until `shutdown` resolves.
-async fn run(shutdown: impl Future<Output = ()>) {
-    info!(service = %SERVICE, state = "idle", "ready; no event source until durable acceptance (M2)");
-    shutdown.await;
-    info!(service = %SERVICE, state = "stopping", "stopping");
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn runs_until_shutdown_is_signalled() {
-        let still_running = tokio::time::timeout(
-            Duration::from_millis(50),
-            super::run(std::future::pending()),
-        )
-        .await;
-        assert!(
-            still_running.is_err(),
-            "worker exited without a shutdown signal"
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), super::run(std::future::ready(())))
-            .await
-            .expect("worker did not stop after shutdown was signalled");
+    let report = runtime::run(
+        store.clone(),
+        owner,
+        config.runtime,
+        AcknowledgeProcessor,
+        shutdown::signal(),
+    )
+    .await;
+    store.close().await;
+    info!(service = %SERVICE, worker_id = %owner, "shutdown complete");
+    if report.timed_out {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
