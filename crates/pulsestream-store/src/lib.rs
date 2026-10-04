@@ -1,20 +1,24 @@
 //! PulseStream's durable event store on PostgreSQL.
 //!
-//! PostgreSQL is the source of truth (ADR-007):
+//! PostgreSQL is the source of truth (ADR-007, ADR-008):
 //!
 //! - [`Store::admit`] commits an event, or resolves an idempotent replay or
 //!   conflict, in one transaction. A `202` may be returned only after it
 //!   succeeds.
-//! - [`Store::claim`] atomically moves up to `limit` claimable events (pending,
-//!   or processing with an expired lease) to `PROCESSING` under one owner,
-//!   using `FOR UPDATE SKIP LOCKED`, so concurrent workers never claim the same
-//!   row.
-//! - [`Store::complete`] marks an event `PROCESSED` only if the caller still
-//!   owns its claim, so a stale worker cannot overwrite a reclaimed event.
+//! - [`Store::claim`] atomically moves up to `limit` claimable events to
+//!   `PROCESSING` under one owner, using `FOR UPDATE SKIP LOCKED`, so
+//!   concurrent workers never claim the same row. Claimable means `PENDING`
+//!   with `available_at <= now()`, or `PROCESSING` with an expired lease and
+//!   attempts left.
+//! - [`Store::complete`], [`Store::schedule_retry`], and
+//!   [`Store::dead_letter`] change an event only if the caller still owns its
+//!   claim, so a stale worker cannot overwrite a reclaimed event.
+//! - [`Store::dead_letter_expired_final_attempts`] dead-letters events whose
+//!   final permitted attempt lost its lease without reporting a result.
 //!
 //! Processing is at-least-once: a worker that crashes after doing its work but
-//! before `complete` commits leaves the event to be reclaimed after its lease
-//! expires.
+//! before its outcome commits leaves the event to be reclaimed after its
+//! lease expires. Retries do not change that.
 
 #[cfg(feature = "test-util")]
 pub mod testing;
@@ -24,6 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pulsestream_core::config::DatabaseConfig;
 use pulsestream_core::event::{Event, EventId, EventSource, EventStatus, EventType, WorkerId};
+use pulsestream_core::failure::FailureDetail;
 use pulsestream_core::idempotency::{IdempotencyKey, RequestFingerprint};
 use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
@@ -37,6 +42,17 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations"
 /// Server-side limit on any single statement, so a stuck query cannot hold a
 /// request or claim indefinitely.
 pub const STATEMENT_TIMEOUT: &str = "10s";
+
+/// PostgreSQL `to_char` format for RFC 3339 UTC with microseconds.
+macro_rules! rfc3339 {
+    ($column:literal) => {
+        concat!(
+            "to_char(",
+            $column,
+            " AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+        )
+    };
+}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -103,8 +119,8 @@ pub enum AdmitOutcome {
     Conflict,
 }
 
-/// Public, non-sensitive view of a stored event (no payload, key, owner, or
-/// lease).
+/// Public, non-sensitive view of a stored event (no payload, key, owner,
+/// lease, or failure message).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventRecord {
     pub event_id: EventId,
@@ -114,6 +130,18 @@ pub struct EventRecord {
     /// RFC 3339 UTC with microseconds, for example `2026-09-25T18:08:00.845679Z`.
     pub accepted_at: String,
     pub processed_at: Option<String>,
+    pub dead_lettered_at: Option<String>,
+    /// Times the event has been claimed for processing.
+    pub delivery_attempts: u32,
+}
+
+/// An event dead-lettered by [`Store::dead_letter_expired_final_attempts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadLetteredEvent {
+    pub event_id: EventId,
+    pub source: String,
+    pub event_type: String,
+    pub delivery_attempts: u32,
 }
 
 /// An event claimed by a worker.
@@ -124,6 +152,14 @@ pub struct ClaimedEvent {
     pub attempt: u32,
     /// True if this claim took over an expired lease from another claim.
     pub reclaimed: bool,
+}
+
+impl ClaimedEvent {
+    /// True if this claim follows a recorded retryable failure: the event was
+    /// `PENDING` again after an earlier attempt.
+    pub fn is_retry(&self) -> bool {
+        !self.reclaimed && self.attempt > 1
+    }
 }
 
 /// Shared handle to the PostgreSQL pool. Cheap to clone.
@@ -235,18 +271,39 @@ impl Store {
     pub async fn get(&self, id: EventId) -> Result<Option<EventRecord>, StoreError> {
         // Timestamps are formatted as RFC 3339 UTC by PostgreSQL, which avoids a
         // date/time dependency just for serialization.
-        let row: Option<(Uuid, String, String, String, String, Option<String>)> =
-            sqlx::query_as(
-                "SELECT event_id, source, event_type, status, \
-                        to_char(accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'), \
-                        to_char(processed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
-                 FROM events WHERE event_id = $1",
-            )
-                .bind(id.as_uuid())
-                .fetch_optional(&self.pool)
-                .await?;
+        type Row = (
+            Uuid,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i32,
+        );
+        let row: Option<Row> = sqlx::query_as(concat!(
+            "SELECT event_id, source, event_type, status, ",
+            rfc3339!("accepted_at"),
+            ", ",
+            rfc3339!("processed_at"),
+            ", ",
+            rfc3339!("dead_lettered_at"),
+            ", delivery_attempts FROM events WHERE event_id = $1"
+        ))
+        .bind(id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
         row.map(
-            |(id, source, event_type, status, accepted_at, processed_at)| {
+            |(
+                id,
+                source,
+                event_type,
+                status,
+                accepted_at,
+                processed_at,
+                dead_lettered_at,
+                attempts,
+            )| {
                 Ok(EventRecord {
                     event_id: EventId::from_uuid(id),
                     source,
@@ -255,6 +312,8 @@ impl Store {
                         .ok_or(StoreError::Inconsistent("unknown status"))?,
                     accepted_at,
                     processed_at,
+                    dead_lettered_at,
+                    delivery_attempts: attempts_from_db(attempts)?,
                 })
             },
         )
@@ -263,16 +322,20 @@ impl Store {
 
     /// Atomically claims up to `limit` events for `owner`, oldest first.
     ///
-    /// Claimable means `PENDING`, or `PROCESSING` with an expired lease (the
-    /// previous owner is presumed dead). Each claimed row becomes `PROCESSING`
-    /// with `owner`, a lease of `lease` from now (database clock), and
-    /// `delivery_attempts + 1`. Rows locked by a concurrent claim are skipped,
+    /// Claimable means `PENDING` with `available_at <= now()` (so a scheduled
+    /// retry is never claimed early), or `PROCESSING` with an expired lease
+    /// (the previous owner is presumed dead) and fewer than
+    /// `max_delivery_attempts` attempts. `DEAD_LETTERED` and `PROCESSED` rows
+    /// are never claimable. Each claimed row becomes `PROCESSING` with `owner`,
+    /// a lease of `lease` from now, and `delivery_attempts + 1`. All times use
+    /// the database clock. Rows locked by a concurrent claim are skipped,
     /// never double-claimed.
     pub async fn claim(
         &self,
         owner: WorkerId,
         limit: usize,
         lease: Duration,
+        max_delivery_attempts: u32,
     ) -> Result<Vec<ClaimedEvent>, StoreError> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -281,8 +344,9 @@ impl Store {
         let rows: Vec<(Uuid, String, String, Value, i64, i32, String)> = sqlx::query_as(
             "WITH candidates AS ( \
                  SELECT event_id, status AS previous_status FROM events \
-                 WHERE status = 'PENDING' \
-                    OR (status = 'PROCESSING' AND lease_expires_at <= now()) \
+                 WHERE (status = 'PENDING' AND available_at <= now()) \
+                    OR (status = 'PROCESSING' AND lease_expires_at <= now() \
+                        AND delivery_attempts < $4) \
                  ORDER BY accepted_at, event_id \
                  LIMIT $2 \
                  FOR UPDATE SKIP LOCKED \
@@ -302,6 +366,7 @@ impl Store {
         .bind(owner.as_uuid())
         .bind(limit)
         .bind(lease.as_secs_f64())
+        .bind(attempts_to_db(max_delivery_attempts))
         .fetch_all(&self.pool)
         .await?;
 
@@ -322,8 +387,7 @@ impl Store {
                             payload,
                             accepted_at,
                         },
-                        attempt: u32::try_from(attempts)
-                            .map_err(|_| StoreError::Inconsistent("negative delivery_attempts"))?,
+                        attempt: attempts_from_db(attempts)?,
                         reclaimed: previous == EventStatus::Processing.as_db_str(),
                     })
                 },
@@ -352,8 +416,144 @@ impl Store {
         Ok(result.rows_affected() == 1)
     }
 
+    /// After a retryable failure: returns the event to `PENDING`, eligible
+    /// again `delay` from now (database clock), and records the failure.
+    ///
+    /// Applies only if `owner` still holds the claim. Returns the new
+    /// `available_at` (RFC 3339 UTC), or `None` when the claim was lost, in
+    /// which case nothing is changed.
+    pub async fn schedule_retry(
+        &self,
+        id: EventId,
+        owner: WorkerId,
+        delay: Duration,
+        failure: &FailureDetail,
+    ) -> Result<Option<String>, StoreError> {
+        let available_at: Option<String> = sqlx::query_scalar(concat!(
+            "UPDATE events SET \
+                 status = 'PENDING', \
+                 processing_owner = NULL, \
+                 processing_started_at = NULL, \
+                 lease_expires_at = NULL, \
+                 available_at = now() + make_interval(secs => $3), \
+                 last_failure_code = $4, \
+                 last_failure_message = $5, \
+                 last_failed_at = now() \
+             WHERE event_id = $1 AND status = 'PROCESSING' AND processing_owner = $2 \
+             RETURNING ",
+            rfc3339!("available_at")
+        ))
+        .bind(id.as_uuid())
+        .bind(owner.as_uuid())
+        .bind(delay.as_secs_f64())
+        .bind(failure.code.as_str())
+        .bind(failure.message.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(available_at)
+    }
+
+    /// After a permanent failure, or a retryable failure with no attempts left:
+    /// moves the event to the terminal `DEAD_LETTERED` state and records the
+    /// failure. The row, its content, and its attempt count are kept.
+    ///
+    /// Applies only if `owner` still holds the claim. Returns `false` when the
+    /// claim was lost, in which case nothing is changed.
+    pub async fn dead_letter(
+        &self,
+        id: EventId,
+        owner: WorkerId,
+        failure: &FailureDetail,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE events SET \
+                 status = 'DEAD_LETTERED', \
+                 processing_owner = NULL, \
+                 lease_expires_at = NULL, \
+                 dead_lettered_at = now(), \
+                 last_failure_code = $3, \
+                 last_failure_message = $4, \
+                 last_failed_at = now() \
+             WHERE event_id = $1 AND status = 'PROCESSING' AND processing_owner = $2",
+        )
+        .bind(id.as_uuid())
+        .bind(owner.as_uuid())
+        .bind(failure.code.as_str())
+        .bind(failure.message.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Dead-letters up to `limit` events whose lease expired on their final
+    /// permitted attempt (`delivery_attempts >= max_delivery_attempts`).
+    ///
+    /// Such an event's last attempt never reported a result, and [`claim`]
+    /// will not start another one, so without this it would stay `PROCESSING`
+    /// forever. It is recorded with the `LEASE_EXPIRED` failure code. Rows
+    /// locked by a concurrent claim or sweep are skipped.
+    ///
+    /// [`claim`]: Self::claim
+    pub async fn dead_letter_expired_final_attempts(
+        &self,
+        max_delivery_attempts: u32,
+        limit: usize,
+    ) -> Result<Vec<DeadLetteredEvent>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let failure = FailureDetail::lease_expired();
+        let rows: Vec<(Uuid, String, String, i32)> = sqlx::query_as(
+            "WITH exhausted AS ( \
+                 SELECT event_id FROM events \
+                 WHERE status = 'PROCESSING' AND lease_expires_at <= now() \
+                   AND delivery_attempts >= $1 \
+                 ORDER BY lease_expires_at, event_id \
+                 LIMIT $2 \
+                 FOR UPDATE SKIP LOCKED \
+             ) \
+             UPDATE events e SET \
+                 status = 'DEAD_LETTERED', \
+                 processing_owner = NULL, \
+                 lease_expires_at = NULL, \
+                 dead_lettered_at = now(), \
+                 last_failure_code = $3, \
+                 last_failure_message = $4, \
+                 last_failed_at = now() \
+             FROM exhausted x \
+             WHERE e.event_id = x.event_id \
+             RETURNING e.event_id, e.source, e.event_type, e.delivery_attempts",
+        )
+        .bind(attempts_to_db(max_delivery_attempts))
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .bind(failure.code.as_str())
+        .bind(failure.message.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, source, event_type, attempts)| {
+                Ok(DeadLetteredEvent {
+                    event_id: EventId::from_uuid(id),
+                    source,
+                    event_type,
+                    delivery_attempts: attempts_from_db(attempts)?,
+                })
+            })
+            .collect()
+    }
+
     /// The underlying pool, for tests and diagnostics.
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+}
+
+fn attempts_from_db(attempts: i32) -> Result<u32, StoreError> {
+    u32::try_from(attempts).map_err(|_| StoreError::Inconsistent("negative delivery_attempts"))
+}
+
+/// Attempt limits come from validated configuration (at most 100); saturate
+/// rather than wrap if a caller passes something larger.
+fn attempts_to_db(attempts: u32) -> i32 {
+    i32::try_from(attempts).unwrap_or(i32::MAX)
 }

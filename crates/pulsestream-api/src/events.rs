@@ -2,7 +2,8 @@
 //! `GET /v1/events/{event_id}` (status lookup).
 //!
 //! `202 Accepted` means the event row has been **committed to PostgreSQL**. It
-//! survives API and worker restarts. Processing is at-least-once. Every `202`
+//! survives API and worker restarts. Processing is at-least-once, including
+//! across retries. Every `202`
 //! carries `Idempotency-Replayed: false` (new event) or `true` (exact replay of
 //! an earlier request, returning the original event ID).
 
@@ -43,17 +44,22 @@ pub struct AcceptedResponse {
     status: &'static str,
 }
 
-/// Public status view. The payload, idempotency key, fingerprint, owner, and
-/// lease are deliberately not exposed: payloads may carry sensitive business
-/// data, and the rest are implementation details.
+/// Public status view. The payload, idempotency key, fingerprint, owner,
+/// lease, and failure message are deliberately not exposed: payloads may carry
+/// sensitive business data, failure messages come from processors, and the
+/// rest are implementation details. A scheduled retry reports `pending`.
 #[derive(Debug, Serialize)]
 pub struct EventStatusResponse {
     event_id: String,
     source: String,
     event_type: String,
+    /// `pending`, `processing`, `processed`, or `dead_lettered`.
     status: &'static str,
     accepted_at: String,
     processed_at: Option<String>,
+    dead_lettered_at: Option<String>,
+    /// Times the event has been claimed for processing.
+    delivery_attempts: u32,
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, IdempotencyKeyError> {
@@ -154,6 +160,8 @@ pub async fn get(
         status: record.status.as_api_str(),
         accepted_at: record.accepted_at,
         processed_at: record.processed_at,
+        dead_lettered_at: record.dead_lettered_at,
+        delivery_attempts: record.delivery_attempts,
     }))
 }
 
@@ -167,6 +175,7 @@ mod tests {
     use futures_util::stream;
     use pulsestream_core::config::{DatabaseConfig, DatabaseUrl, WorkerRuntimeConfig};
     use pulsestream_core::event::WorkerId;
+    use pulsestream_core::failure::{FailureCode, FailureDetail};
     use pulsestream_store::Store;
     use pulsestream_store::testing::{OutageProxy, TestDatabase};
     use pulsestream_worker::processor::AcknowledgeProcessor;
@@ -514,18 +523,21 @@ mod tests {
         assert_eq!(status.status, StatusCode::OK);
         assert_eq!(status.json["status"], "pending");
         assert_eq!(status.json["processed_at"], Value::Null);
+        assert_eq!(status.json["delivery_attempts"], 0);
         let fields: Vec<_> = status.json.as_object().unwrap().keys().cloned().collect();
         assert_eq!(
             fields,
             [
                 "accepted_at",
+                "dead_lettered_at",
+                "delivery_attempts",
                 "event_id",
                 "event_type",
                 "processed_at",
                 "source",
                 "status"
             ],
-            "no payload, key, fingerprint, owner, or lease is exposed"
+            "no payload, key, fingerprint, owner, lease, or failure message is exposed"
         );
 
         // A worker processes it; the status reflects the durable transition.
@@ -561,6 +573,8 @@ mod tests {
                 .unwrap()
                 .ends_with('Z')
         );
+        assert_eq!(processed.json["delivery_attempts"], 1);
+        assert_eq!(processed.json["dead_lettered_at"], Value::Null);
         stop_tx.send(()).unwrap();
         assert_eq!(worker.await.unwrap().processed, 1);
 
@@ -571,6 +585,62 @@ mod tests {
         .await;
         assert_eq!(missing.status, StatusCode::NOT_FOUND);
         assert_eq!(missing.json["code"], "EVENT_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL (PULSESTREAM_TEST_DATABASE_URL)"]
+    async fn dead_lettered_event_is_reported_without_failure_details_and_service_stays_ready() {
+        let db = TestDatabase::create().await;
+        let accepted = send(app(&db.store), post_json("poison", &valid())).await;
+        let event_id = accepted.json["event_id"].as_str().unwrap().to_owned();
+        let owner = WorkerId::new();
+        let claim = db
+            .store
+            .claim(owner, 1, Duration::from_secs(30), 5)
+            .await
+            .unwrap();
+        let failure = FailureDetail::new(
+            FailureCode::new("INVALID_DESTINATION").unwrap(),
+            "secret-ish processor detail",
+        );
+        assert!(
+            db.store
+                .dead_letter(claim[0].event.id, owner, &failure)
+                .await
+                .unwrap()
+        );
+
+        let status = send(app(&db.store), get(&event_id)).await;
+        assert_eq!(status.status, StatusCode::OK);
+        assert_eq!(status.json["status"], "dead_lettered");
+        assert_eq!(status.json["delivery_attempts"], 1);
+        assert!(
+            status.json["dead_lettered_at"]
+                .as_str()
+                .unwrap()
+                .ends_with('Z')
+        );
+        assert_eq!(status.json["processed_at"], Value::Null);
+        let body = status.json.to_string();
+        assert!(!body.contains("secret-ish") && !body.contains("INVALID_DESTINATION"));
+
+        // One dead-lettered event is a business outcome, not an outage.
+        let ready = send(
+            app(&db.store),
+            Request::get("/health/ready").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(ready.status, StatusCode::OK);
+        // A replay of the dead-lettered event's request is still idempotent.
+        let replay = send(app(&db.store), post_json("poison", &valid())).await;
+        assert_eq!(replay.status, StatusCode::ACCEPTED);
+        assert_eq!(replay.json["event_id"], event_id.as_str());
+        assert_eq!(replay.replayed.as_deref(), Some("true"));
+        assert_eq!(
+            send(app(&db.store), get(&event_id)).await.json["delivery_attempts"],
+            1,
+            "a replay does not consume an attempt"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

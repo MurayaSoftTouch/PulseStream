@@ -24,5 +24,10 @@ pulsestream-store = { workspace = true, features = ["test-util"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
+# Manual retry/dead-letter smoke harness; see the file's header.
+[[example]]
+name = "scripted_worker"
+required-features = ["test-util"]
+
 [lints]
 workspace = true

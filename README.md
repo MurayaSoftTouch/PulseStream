@@ -3,23 +3,27 @@
 A Rust event processing platform being built for bounded concurrency,
 idempotency, retries, recovery, and observability.
 
-> **Status: Milestone 2 (Durable persistence, idempotency, and crash recovery).**
+> **Status: Milestone 3 (Retry, dead-letter, and failure handling).**
 >
 > **PulseStream provides durable admission with at-least-once processing.**
 > `202 Accepted` means the event has been committed to PostgreSQL, so it
 > survives API and worker restarts. Processing is at-least-once, **not**
-> exactly-once: after a crash, an event can be processed again. Retries with
-> backoff and a dead-letter queue arrive in M3.
+> exactly-once. A handler may execute more than once: after a crash, after a
+> lease expiry, and after every retryable failure. Consumers performing
+> external side effects should be idempotent. Retries and the dead-letter
+> state bound how often an event is attempted. They do not make processing
+> exactly-once.
 
 ## Current vs. planned
 
-| Area | Current (M2) | Planned |
+| Area | Current (M3) | Planned |
 | --- | --- | --- |
 | Admission | `POST /v1/events` commits to PostgreSQL before returning `202`. A database outage returns `503` and never `202` | Backlog limits (M4) |
 | Idempotency | Required `Idempotency-Key`, scoped by `source` and enforced by a unique constraint. An exact replay returns the original ID; reuse with a different request returns `409` | |
-| Lifecycle | Persisted `pending` → `processing` → `processed`. `GET /v1/events/{id}` reports status | Failed, retrying, and dead-letter states (M3) |
-| Processing | Workers claim atomically (`FOR UPDATE SKIP LOCKED`), at most their free capacity, with owner IDs and leases | Retry with backoff, dead-letter, poison-event policy (M3) |
-| Recovery | An expired lease is reclaimed by any worker. Stale owners cannot complete reclaimed events | |
+| Lifecycle | Persisted `pending` → `processing` → `processed` or `dead_lettered`. A scheduled retry is `pending` with a future `available_at`. `GET /v1/events/{id}` reports status and `delivery_attempts` | |
+| Processing | Workers claim atomically (`FOR UPDATE SKIP LOCKED`) only events that are due, at most their free capacity, with owner IDs and leases | |
+| Failures | Processors return **retryable** or **permanent** failures with a stable code. Retryable failures back off exponentially (deterministic jitter, capped). After the maximum attempts, or on a permanent failure, the event is **dead-lettered** in PostgreSQL with safe failure metadata | Authenticated dead-letter inspection and redrive (M5/M6) |
+| Recovery | An expired lease is reclaimed by any worker, without backoff. An expired lease on the final permitted attempt is dead-lettered (`LEASE_EXPIRED`). Stale owners cannot complete, retry, or dead-letter reclaimed events | |
 | Delivery semantics | **Durable admission, at-least-once processing.** No exactly-once claim | |
 | Observability | Structured lifecycle logs. Readiness checks the database | Metrics (M4/M5), dashboard (M6) |
 | Security | No authentication or authorization | M5 |
@@ -28,21 +32,24 @@ idempotency, retries, recovery, and observability.
 ## Architecture
 
 ```text
-Client ─▶ API ─(one transaction, 202 after COMMIT)─▶ PostgreSQL events ─(SKIP LOCKED claim)─▶ bounded workers
-                                                                                                ├─▶ PROCESSED
-                                                                                                └─▶ lease expiry → reclaim
+Client ─▶ API ─(one transaction, 202 after COMMIT)─▶ PostgreSQL events ─(SKIP LOCKED claim of due events)─▶ bounded workers
+                                                                                                          ├─▶ PROCESSED
+                                                                                                          ├─▶ retryable → PENDING + available_at (backoff)
+                                                                                                          ├─▶ permanent / exhausted → DEAD_LETTERED
+                                                                                                          └─▶ lease expiry → reclaim
 ```
 
 | Crate | Kind | Responsibility |
 | --- | --- | --- |
-| [`pulsestream-core`](crates/pulsestream-core) | library | Event model, idempotency keys, request fingerprints, env config. No HTTP, DB, or runtime deps |
-| [`pulsestream-store`](crates/pulsestream-store) | library | All SQL: admission, status, claim, complete. Embeds [`migrations/`](migrations) |
+| [`pulsestream-core`](crates/pulsestream-core) | library | Event model, idempotency keys, request fingerprints, failure codes, retry policy, env config. No HTTP, DB, or runtime deps |
+| [`pulsestream-store`](crates/pulsestream-store) | library | All SQL: admission, status, claim, complete, retry, dead-letter. Embeds [`migrations/`](migrations) |
 | [`pulsestream-api`](crates/pulsestream-api) | binary | HTTP admission, status lookup, health |
-| [`pulsestream-worker`](crates/pulsestream-worker) | library + binary | Bounded claim/process runtime with leases |
+| [`pulsestream-worker`](crates/pulsestream-worker) | library + binary | Bounded claim/process runtime with leases and the retry policy |
 
 Read more in the [architecture overview](docs/architecture/overview.md), the
 [ADRs](docs/adr/) (especially
-[ADR-007](docs/adr/ADR-007-postgresql-durable-admission-and-leases.md)), and the
+[ADR-007](docs/adr/ADR-007-postgresql-durable-admission-and-leases.md) and
+[ADR-008](docs/adr/ADR-008-retry-scheduling-and-dead-letter-policy.md)), and the
 [roadmap](docs/backlog/roadmap.md).
 
 ## Requirements
@@ -60,7 +67,7 @@ Read more in the [architecture overview](docs/architecture/overview.md), the
 ## Local setup
 
 ```bash
-git clone git@github.com:Ngetich-86/PulseStream.git
+git clone git@github.com:MurayaSoftTouch/PulseStream.git
 cd PulseStream
 cp .env.example .env              # local-only placeholder values; .env is git-ignored
 docker compose up -d postgres     # wait for (healthy): docker compose ps
@@ -85,6 +92,9 @@ created before M2, run this once:
 | `PULSESTREAM_POLL_INTERVAL_MS` | worker | `250` | Sleep when no work is available, `10`–`60000` |
 | `PULSESTREAM_PROCESSING_LEASE_MS` | worker | `30000` | Claim lease before another worker may reclaim, `1000`–`3600000` |
 | `PULSESTREAM_SHUTDOWN_TIMEOUT_MS` | worker | `10000` | Wait for active events at shutdown, `1`–`300000` |
+| `PULSESTREAM_MAX_DELIVERY_ATTEMPTS` | worker | `5` | Maximum times an event is processed (claimed) before it is dead-lettered, `1`–`100` |
+| `PULSESTREAM_RETRY_BASE_DELAY_MS` | worker | `1000` | Backoff after attempt 1, `1`–`600000` |
+| `PULSESTREAM_RETRY_MAX_DELAY_MS` | worker | `60000` | Backoff cap, `1`–`86400000`. Must not be below the base delay |
 | `RUST_LOG` | api, worker | `info` | `EnvFilter` syntax. An invalid filter logs a warning and uses `info` |
 
 Invalid values stop startup with a clear error. They are never silently
@@ -112,7 +122,8 @@ curl -si http://127.0.0.1:8088/v1/events \
 
 curl -s http://127.0.0.1:8088/v1/events/<uuid>
 # {"event_id":"<uuid>","source":"orders-api","event_type":"order.created",
-#  "status":"processed","accepted_at":"2026-...Z","processed_at":"2026-...Z"}
+#  "status":"processed","accepted_at":"2026-...Z","processed_at":"2026-...Z",
+#  "dead_lettered_at":null,"delivery_attempts":1}
 ```
 
 **Request rules.** `source` is 1–100 characters and `event_type` is 1–150
@@ -139,11 +150,50 @@ carries `idempotency-replayed`, set to `true` or `false`.
 | `503` | `PERSISTENCE_UNAVAILABLE` | Database unreachable. Sent with `Retry-After: 1`. Retry with the same key |
 | `500` | `INTERNAL_ERROR` | Unexpected server error. Details are logged, not returned |
 
-`GET /v1/events/{event_id}` returns metadata and status (`pending`,
-`processing`, or `processed`). It deliberately omits the **payload** (payloads
-may hold sensitive business data) and internal fields such as the key, owner,
-and lease. Unknown IDs return `404 EVENT_NOT_FOUND`, and malformed IDs return
+`GET /v1/events/{event_id}` returns metadata, status (`pending`,
+`processing`, `processed`, or `dead_lettered`), `delivery_attempts`, and
+`dead_lettered_at`. A scheduled retry reports `pending`. It deliberately omits
+the **payload** (payloads may hold sensitive business data), the failure code
+and message, and internal fields such as the key, owner, lease, and
+`available_at`. Unknown IDs return `404 EVENT_NOT_FOUND`, and malformed IDs return
 `400 INVALID_EVENT_ID`.
+
+### Failure handling (M3)
+
+A processor returns `Ok`, `ProcessError::Retryable`, or
+`ProcessError::Permanent`. A failure carries a stable code such as
+`UPSTREAM_TIMEOUT` and a short message. Retryability comes from the variant,
+never from parsing the message. A panic counts as a retryable
+`PROCESSOR_PANICKED` failure.
+
+| Outcome on delivery attempt `n` | Result |
+| --- | --- |
+| Success | `PROCESSED` |
+| Retryable, `n < max` | `PENDING`, eligible again at `available_at = now + delay` (database clock) |
+| Retryable, `n = max` | `DEAD_LETTERED` (`retry_exhausted`) |
+| Permanent | `DEAD_LETTERED` immediately, whatever budget remains |
+| Lease expired (crash), `n < max` | Reclaimed by any worker, without backoff |
+| Lease expired on the final attempt | `DEAD_LETTERED` with `LEASE_EXPIRED` |
+
+- **Attempts.** `delivery_attempts` counts claims into `processing`. With
+  the default of 5, an event is processed **at most five times**. HTTP
+  replays and failed claim transactions do not consume attempts.
+- **Backoff.** `min(max_delay, base_delay × 2^(n−1))`, scaled by a
+  deterministic jitter factor between 80% and 100%. The factor is derived
+  from the event ID and attempt, so it never exceeds the cap. With the
+  defaults: about 1 s, 2 s, 4 s, then 8 s.
+- **Dead letters** stay in the `events` table with their original content,
+  attempt count, `dead_lettered_at`, and `last_failure_code`,
+  `last_failure_message` (at most 1024 characters), and `last_failed_at`.
+  They are never claimed again. After an eventual success, `last_failure_*`
+  is kept for diagnostics.
+- **Inspecting dead letters** uses SQL for now, for example:
+  `SELECT event_id, source, event_type, delivery_attempts, last_failure_code,
+  dead_lettered_at FROM events WHERE status = 'DEAD_LETTERED';`
+- **No redrive yet.** There is no API to list or re-run dead-lettered events,
+  because the API has no authentication (M5).
+
+See [ADR-008](docs/adr/ADR-008-retry-scheduling-and-dead-letter-policy.md).
 
 ### Health
 
@@ -152,6 +202,8 @@ and lease. Unknown IDs return `404 EVENT_NOT_FOUND`, and malformed IDs return
 - `GET /health/ready` returns `200` with `{"checks":{"database":"ready"}}` when
   PostgreSQL answers a lightweight query within 2 s. Otherwise it returns `503`
   with `"unavailable"`. It recovers on its own when the database returns.
+  Processing failures and dead-lettered events never make the service
+  unready.
 
 ### Shutdown
 
@@ -178,6 +230,20 @@ a database. The test database name **must end in `_test`**; anything else is
 refused. Each test creates and drops its own disposable database, so tests are
 isolated and never touch `DATABASE_URL`. See [tests/README.md](tests/README.md).
 
+### Manual retry and dead-letter smoke
+
+[`crates/pulsestream-worker/examples/scripted_worker.rs`](crates/pulsestream-worker/examples/scripted_worker.rs)
+runs the real worker runtime with a processor
+that follows `PULSESTREAM_SMOKE_SCRIPT` (`succeed`, `panic`,
+`retryable:<CODE>`, `permanent:<CODE>`; the last step repeats):
+
+```bash
+PULSESTREAM_SMOKE_SCRIPT=retryable:UPSTREAM_TIMEOUT,succeed \
+  cargo run -p pulsestream-worker --features test-util --example scripted_worker
+```
+
+It is a development tool only, not part of the worker binary.
+
 ### Disk footprint
 
 `[profile.dev]` and `[profile.test]` disable incremental compilation and keep
@@ -198,18 +264,20 @@ All jobs use the pinned toolchain with `--locked`.
 
 ## Current limitations
 
-- **Processing is at-least-once.** Processors with external side effects must
-  be idempotent, for example by keying effects on `event_id`.
-- **No exactly-once guarantee.**
-- **No retry policy, backoff, or dead-letter queue yet (M3).** A failing event
-  is reclaimed after every lease expiry, with no limit.
+- **Processing is at-least-once.** A handler may execute more than once
+  across crashes, lease expiry, and retries. Processors with external side
+  effects must be idempotent, for example by keying effects on `event_id`.
+- **No exactly-once guarantee.** Retries and dead-lettering do not change
+  this.
+- **No authenticated redrive API** and **no dead-letter operations UI** yet.
+  Dead-lettered events are inspected with SQL (M5/M6).
 - No lease extension: processing that outlasts the lease may run concurrently
-  on another worker. Completion stays owner-checked.
+  on another worker. Every outcome write stays owner-checked.
 - No admission-side backlog limit. The durable backlog is bounded by
   PostgreSQL storage.
 - No authentication or authorization yet.
-- PostgreSQL is the only durable work store. There is no message broker
-  (ADR-003).
+- PostgreSQL is the only durable work store. There is no external message
+  broker (ADR-003).
 - Not benchmarked or load-tested. No throughput or latency claims.
 
 ## Roadmap
@@ -221,3 +289,12 @@ See [docs/backlog/roadmap.md](docs/backlog/roadmap.md).
 PulseStream is being developed collaboratively by **Ngetich-86**, **LMichy1**,
 and **MurayaSoftTouch**. Milestone ownership and actual contributions are
 preserved through Git history and pull requests.
+
+### Repository history
+
+Development through Milestone 2 originated in
+[Ngetich-86/PulseStream](https://github.com/Ngetich-86/PulseStream), where the
+M0–M2 pull requests and their reviews remain.
+[MurayaSoftTouch/PulseStream](https://github.com/MurayaSoftTouch/PulseStream)
+is the canonical repository beginning with Milestone 3. The Git history was
+carried over unchanged.

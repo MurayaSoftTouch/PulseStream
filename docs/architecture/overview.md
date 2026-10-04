@@ -1,11 +1,11 @@
 # PulseStream Architecture Overview
 
-Status: **M2 (Durable persistence, idempotency, and crash recovery)**.
+Status: **M3 (Retry, dead-letter, and failure handling)**.
 **IMPLEMENTED** means it is in the code and covered by tests. **PLANNED** means
 it is a design intention only.
 
 **PulseStream provides durable admission with at-least-once processing.** It
-does not provide exactly-once processing.
+does not provide exactly-once processing, and retries do not change that.
 
 ## Data plane
 
@@ -19,19 +19,29 @@ PulseStream API ............................. IMPLEMENTED
   |  one transaction: INSERT ... ON CONFLICT DO NOTHING, then fingerprint check
   |  202 only after COMMIT
   v
-PostgreSQL `events` table (source of truth) . IMPLEMENTED: PENDING -> PROCESSING -> PROCESSED
+PostgreSQL `events` table (source of truth) . IMPLEMENTED
   |
-  |  atomic claim: FOR UPDATE SKIP LOCKED, at most free capacity
+  |  eligible: PENDING with available_at <= now()   (database clock)
+  |         or PROCESSING with an expired lease and attempts left
   v
-Bounded worker runtime(s) ................... IMPLEMENTED: owner ID, lease, conditional completion
+claim: FOR UPDATE SKIP LOCKED, at most free capacity, delivery_attempts + 1
   |
-  +--> PROCESSED ............................ IMPLEMENTED (owner-checked)
+PROCESSING .................................. IMPLEMENTED: owner ID, lease
   |
-  +--> lease expiry -> reclaim .............. IMPLEMENTED (crash recovery; delivery_attempts + 1)
+  +--> success ------------------------> PROCESSED ........... IMPLEMENTED (owner-checked)
   |
-  +--> retry with backoff ................... PLANNED (M3)
+  +--> retryable failure, attempts left
+  |       |
+  |       v
+  |    PENDING + available_at = now + backoff ................ IMPLEMENTED (owner-checked)
   |
-  +--> dead-letter .......................... PLANNED (M3)
+  +--> permanent failure, or retryable on the final attempt
+  |       |
+  |       v
+  |    DEAD_LETTERED ......................................... IMPLEMENTED (owner-checked, terminal)
+  |
+  +--> lease expiry -> reclaim (no backoff) .................. IMPLEMENTED (crash recovery)
+          on the final attempt -> DEAD_LETTERED (LEASE_EXPIRED)
 ```
 
 The API and the worker are separate processes. They communicate only through
@@ -45,10 +55,11 @@ removed.
 | HTTP admission | `pulsestream-api` `events.rs` | **IMPLEMENTED.** Validation, 64 KiB limit, required `Idempotency-Key`, `202`/`409`/`503` |
 | Status lookup | `GET /v1/events/{event_id}` | **IMPLEMENTED.** Metadata only, never the payload |
 | Event model, idempotency key, fingerprint | `pulsestream-core` | **IMPLEMENTED.** No HTTP, database, or runtime dependencies |
-| Durable store | `pulsestream-store` + `migrations/` | **IMPLEMENTED.** Admission, claim, complete, status. Schema constraints and immutability trigger |
-| Worker runtime | `pulsestream-worker` `runtime.rs` | **IMPLEMENTED.** Bounded claims, leases, graceful shutdown |
+| Durable store | `pulsestream-store` + `migrations/` | **IMPLEMENTED.** Admission, claim, complete, retry, dead-letter, status. Schema constraints and immutability trigger |
+| Worker runtime | `pulsestream-worker` `runtime.rs` | **IMPLEMENTED.** Bounded claims, leases, graceful shutdown, failure handling |
+| Retry policy, backoff, dead-letter, poison events | `pulsestream-core` `retry.rs`, `failure.rs` | **IMPLEMENTED** ([ADR-008](../adr/ADR-008-retry-scheduling-and-dead-letter-policy.md)) |
 | Readiness | `GET /health/ready` | **IMPLEMENTED.** The `database` check |
-| Retry policy, backoff, dead-letter, poison events | | **PLANNED** (M3) |
+| Dead-letter inspection API and redrive | | **PLANNED** (M5/M6, behind authentication) |
 | Admission backlog limits, benchmarks, load tests | | **PLANNED** (M4) |
 | Authentication and authorization, metrics, TLS hardening | | **PLANNED** (M5) |
 | Operations dashboard | | **PLANNED** (M6) |
@@ -85,6 +96,27 @@ removed.
 before `PROCESSED` commits. After the lease expires, the event is reclaimed and
 the effect runs again. Processors with side effects must be idempotent.
 
+### Failure handling
+
+- A processor returns a **retryable** or **permanent** failure with a stable
+  code. A panic counts as retryable (`PROCESSOR_PANICKED`).
+- `delivery_attempts` counts claims. An event is processed at most
+  `PULSESTREAM_MAX_DELIVERY_ATTEMPTS` (default 5) times.
+- A retryable failure with attempts left sets the event back to `PENDING`
+  with `available_at = now + min(max, base × 2^(n−1)) × [0.8, 1.0]`. The
+  jitter is deterministic per event and attempt.
+- A permanent failure, or a retryable failure on the final attempt, moves the
+  event to `DEAD_LETTERED`. It stays in the `events` table with its content,
+  attempt count, and bounded failure metadata, and it is never claimed again.
+- Every outcome write (complete, retry, dead-letter) requires
+  `status = 'PROCESSING' AND processing_owner = <me>`. A stale worker changes
+  nothing.
+- **Crash recovery vs. retry.** Lease expiry means no outcome was recorded, so
+  the event is reclaimed without backoff. A retryable failure was recorded,
+  so the event waits for its backoff. An expired lease on the final attempt
+  is dead-lettered with `LEASE_EXPIRED`, so a worker-crashing poison event
+  still terminates.
+
 ### Boundedness
 
 | Resource | Bound |
@@ -92,6 +124,9 @@ the effect runs again. Processors with side effects must be idempotent.
 | API database connections | `PULSESTREAM_DB_MAX_CONNECTIONS` (default 10). Requests wait at most `PULSESTREAM_DB_ACQUIRE_TIMEOUT_MS` (default 3000), then get `503` |
 | Statement duration | `statement_timeout = 10s` on every connection |
 | Worker in-memory events | `PULSESTREAM_WORKER_CONCURRENCY` (default 4) per worker |
+| Processing attempts per event | `PULSESTREAM_MAX_DELIVERY_ATTEMPTS` (default 5) |
+| Retry delay | `PULSESTREAM_RETRY_MAX_DELAY_MS` (default 60000) |
+| Stored failure message | 1024 characters |
 | Durable backlog | Bounded by PostgreSQL storage only. Admission-side limits are planned for M4 |
 
 ## Operational plane
@@ -101,12 +136,17 @@ the effect runs again. Processors with side effects must be idempotent.
 - **Readiness (IMPLEMENTED).** `/health/ready` runs `SELECT 1` with a 2 s
   timeout. It returns `200` with `checks.database = "ready"`, or `503` with
   `"unavailable"`. The pool validates connections before use, so readiness
-  recovers after a database restart without restarting the API.
+  recovers after a database restart without restarting the API. Processing
+  failures and dead-lettered events never affect readiness.
 - **Lifecycle logs (IMPLEMENTED).** The logged events are: event persisted,
-  idempotency replay, idempotency conflict, event claimed, expired lease
-  reclaimed, event processed, claim lost, and database unavailable. Fields
-  include event ID, source, type, worker ID, and attempt. Payloads, raw
-  idempotency keys, and connection strings are never logged.
+  idempotency replay, idempotency conflict, event claimed, retry claimed,
+  expired lease reclaimed, event processed, processing failed, retry
+  scheduled, event dead-lettered (`reason`: `permanent_failure`,
+  `retry_exhausted`, or `lease_expired_on_final_attempt`), claim lost, and
+  database unavailable. Failure logs carry a `lifecycle` field with these
+  names. Fields include event ID, source, type, worker ID, attempt, failure
+  code, delay, and next available time. Payloads, raw idempotency keys,
+  failure messages, and connection strings are never logged.
 - **Metrics (PLANNED, M4/M5)**, an **operations dashboard (PLANNED, M6)**, and
   **load and benchmark evidence (PLANNED, M4)**.
 
@@ -122,8 +162,8 @@ the effect runs again. Processors with side effects must be idempotent.
    event. The database enforces this.
 5. **Explicit delivery semantics.** Durable admission with at-least-once
    processing. No exactly-once claims.
-6. **Failure visibility.** Lifecycle state is persisted and queryable. M3 adds
-   explicit failed, retrying, and dead-letter states.
+6. **Failure visibility.** Lifecycle state, attempt counts, and the last
+   failure are persisted. Dead-lettered events stay queryable.
 7. **Measured performance.** No performance claims without benchmarks (M4).
 
 ## Process model
