@@ -146,7 +146,16 @@ impl TestDatabase {
 
     /// Retry and failure columns, for assertions.
     pub async fn failure(&self, id: EventId) -> FailureState {
-        type Row = (Option<String>, Option<String>, bool, bool, bool, f64, bool);
+        type Row = (
+            Option<String>,
+            Option<String>,
+            bool,
+            bool,
+            bool,
+            f64,
+            bool,
+            Option<f64>,
+        );
         let (
             code,
             message,
@@ -155,11 +164,13 @@ impl TestDatabase {
             processed,
             available_in_ms,
             available_at_is_accepted_at,
+            scheduled_delay_ms,
         ): Row = sqlx::query_as(
             "SELECT last_failure_code, last_failure_message, last_failed_at IS NOT NULL, \
                         dead_lettered_at IS NOT NULL, processed_at IS NOT NULL, \
                         (extract(epoch FROM available_at - now()) * 1000)::float8, \
-                        available_at = accepted_at \
+                        available_at = accepted_at, \
+                        (extract(epoch FROM available_at - last_failed_at) * 1000)::float8 \
                  FROM events WHERE event_id = $1",
         )
         .bind(id.as_uuid())
@@ -174,6 +185,7 @@ impl TestDatabase {
             processed,
             available_in_ms,
             available_at_is_accepted_at,
+            scheduled_delay_ms,
         }
     }
 
@@ -278,6 +290,11 @@ pub struct FailureState {
     /// the event is eligible.
     pub available_in_ms: f64,
     pub available_at_is_accepted_at: bool,
+    /// `available_at - last_failed_at` in milliseconds. A retry writes both
+    /// in one statement from the same database `now()`, so after a scheduled
+    /// retry this is exactly the persisted delay, however late the test
+    /// observes it. `None` before any failure is recorded.
+    pub scheduled_delay_ms: Option<f64>,
 }
 
 /// A TCP proxy in front of PostgreSQL that can simulate an outage and a
