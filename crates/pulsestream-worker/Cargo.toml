@@ -1,6 +1,6 @@
 [package]
 name = "pulsestream-worker"
-description = "PulseStream bounded event processing (library) and worker process (binary)."
+description = "PulseStream worker: bounded, lease-based processing of durably accepted events."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,12 +13,14 @@ test-util = ["dep:serde_json"]
 
 [dependencies]
 pulsestream-core.workspace = true
+pulsestream-store.workspace = true
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+pulsestream-store = { workspace = true, features = ["test-util"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["time"] }
 

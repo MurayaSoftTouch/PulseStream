@@ -1,159 +1,140 @@
 # PulseStream Architecture Overview
 
-Status: **M1 (Event ingestion and backpressure)**. This document describes the
-intended architecture and marks what exists today. **IMPLEMENTED** means it is
-in the code and covered by tests. **PLANNED** means it is a design intention
-only.
+Status: **M2 (Durable persistence, idempotency, and crash recovery)**.
+**IMPLEMENTED** means it is in the code and covered by tests. **PLANNED** means
+it is a design intention only.
+
+**PulseStream provides durable admission with at-least-once processing.** It
+does not provide exactly-once processing.
 
 ## Data plane
 
-### Implemented in M1
-
 ```text
-Producer / Client
-      |
-      v
-POST /v1/events ................ IMPLEMENTED: validation, 64 KiB limit, UUID v4 event ID, 202/400/413/415/429/503
-      |
-      v
-Bounded admission queue ........ IMPLEMENTED: Tokio mpsc(queue_capacity), try_send; a full queue returns 429
-      |
-      v
-Dispatcher + bounded tasks ..... IMPLEMENTED: at most worker_concurrency events in process at once
-      |
-      +--> processed ........... IMPLEMENTED (logged only; no business action)
-      |
-      +--> failed .............. IMPLEMENTED (logged and counted; not retried)
+Client
+  |
+  |  POST /v1/events  (Idempotency-Key required)
+  v
+PulseStream API ............................. IMPLEMENTED
+  |
+  |  one transaction: INSERT ... ON CONFLICT DO NOTHING, then fingerprint check
+  |  202 only after COMMIT
+  v
+PostgreSQL `events` table (source of truth) . IMPLEMENTED: PENDING -> PROCESSING -> PROCESSED
+  |
+  |  atomic claim: FOR UPDATE SKIP LOCKED, at most free capacity
+  v
+Bounded worker runtime(s) ................... IMPLEMENTED: owner ID, lease, conditional completion
+  |
+  +--> PROCESSED ............................ IMPLEMENTED (owner-checked)
+  |
+  +--> lease expiry -> reclaim .............. IMPLEMENTED (crash recovery; delivery_attempts + 1)
+  |
+  +--> retry with backoff ................... PLANNED (M3)
+  |
+  +--> dead-letter .......................... PLANNED (M3)
 ```
 
-In M1 this whole path runs **in memory, inside the API process**
-([ADR-006](../adr/ADR-006-in-memory-bounded-admission.md)). It is not durable.
-
-### Target architecture
-
-```text
-Producer / Client
-      |
-      v
-PulseStream API ................ IMPLEMENTED (M1)
-      |
-      v
-Bounded Admission Layer ........ IMPLEMENTED in memory (M1); durable admission PLANNED (M2)
-      |
-      v
-Durable Event Store ............ PLANNED (M2): PostgreSQL container exists; no schema
-      |
-      v
-Bounded Worker Pool ............ IMPLEMENTED in-process (M1); consuming from the durable store PLANNED (M2)
-      |
-      +--> success
-      |
-      +--> retry ............... PLANNED (M3)
-      |
-      +--> dead-letter ......... PLANNED (M3)
-```
+The API and the worker are separate processes. They communicate only through
+PostgreSQL, as ADR-002 intended. The M1 in-memory queue (ADR-006) has been
+removed.
 
 ### Components
 
 | Component | Where | Status |
 | --- | --- | --- |
-| HTTP ingestion | `pulsestream-api` (`events.rs`) | **IMPLEMENTED.** Validation, body limit, stable error codes |
-| Event model | `pulsestream-core` (`event.rs`) | **IMPLEMENTED.** `EventId`, `EventSource`, `EventType`, `Event`. HTTP DTOs are kept separate, in the API |
-| Bounded admission | `pulsestream-worker` (`pipeline.rs`) | **IMPLEMENTED** in memory. Durable admission is **PLANNED** (M2) |
-| Bounded processing | `pulsestream-worker` (`pipeline.rs`) | **IMPLEMENTED.** The processor is a no-op acknowledgement |
-| Shutdown drain | API `main.rs` + `Pipeline::shutdown` | **IMPLEMENTED.** Bounded by a timeout |
-| Readiness | `GET /health/ready` | **IMPLEMENTED.** The `processing` check |
-| Durable event store | PostgreSQL | **PLANNED** (M2). Only the local container exists |
-| Idempotency and deduplication | | **PLANNED** (M2) |
-| Crash recovery | | **PLANNED** (M2) |
-| Retry scheduler and dead-letter | | **PLANNED** (M3) |
-| Benchmarks and load tests | | **PLANNED** (M4) |
+| HTTP admission | `pulsestream-api` `events.rs` | **IMPLEMENTED.** Validation, 64 KiB limit, required `Idempotency-Key`, `202`/`409`/`503` |
+| Status lookup | `GET /v1/events/{event_id}` | **IMPLEMENTED.** Metadata only, never the payload |
+| Event model, idempotency key, fingerprint | `pulsestream-core` | **IMPLEMENTED.** No HTTP, database, or runtime dependencies |
+| Durable store | `pulsestream-store` + `migrations/` | **IMPLEMENTED.** Admission, claim, complete, status. Schema constraints and immutability trigger |
+| Worker runtime | `pulsestream-worker` `runtime.rs` | **IMPLEMENTED.** Bounded claims, leases, graceful shutdown |
+| Readiness | `GET /health/ready` | **IMPLEMENTED.** The `database` check |
+| Retry policy, backoff, dead-letter, poison events | | **PLANNED** (M3) |
+| Admission backlog limits, benchmarks, load tests | | **PLANNED** (M4) |
+| Authentication and authorization, metrics, TLS hardening | | **PLANNED** (M5) |
 | Operations dashboard | | **PLANNED** (M6) |
+
+### Acceptance and idempotency
+
+- `202 Accepted` means the event row **has committed** to PostgreSQL. A
+  database failure never produces `202`.
+- Scope: `UNIQUE (source, idempotency_key)`. The same key under different
+  sources gives independent events.
+- Exact replay (same scoped key, same fingerprint) returns `202` with the
+  original event ID and `Idempotency-Replayed: true`. New events carry
+  `Idempotency-Replayed: false`.
+- Conflicting reuse (same scoped key, different fingerprint) returns `409
+  IDEMPOTENCY_CONFLICT`. The stored event is never changed.
+- Fingerprint: SHA-256 over a versioned encoding of `source`, `event_type`, and
+  the canonical payload. Object keys are sorted recursively and array order is
+  significant.
+
+### Processing and recovery
+
+- A worker claims at most `concurrency - active` rows per statement and never
+  prefetches. Live tasks never exceed `concurrency` (default 4).
+- Claims record `processing_owner` (the worker's ID), `lease_expires_at` (now +
+  30 s by default), and `delivery_attempts + 1`.
+- Completion requires that the worker still owns the claim, so a stale worker
+  cannot overwrite a reclaimed event.
+- If a worker crashes, its rows stay `PROCESSING`. After the lease expires, any
+  worker reclaims them.
+- Shutdown: claiming stops, active events finish within the timeout, and
+  anything left is abandoned to lease recovery. Rows are not reset.
+
+**At-least-once example.** A worker performs an external effect, then crashes
+before `PROCESSED` commits. After the lease expires, the event is reclaimed and
+the effect runs again. Processors with side effects must be idempotent.
 
 ### Boundedness
 
-```text
-maximum logical pipeline occupancy = queue_capacity + worker_concurrency
-                                   = 256 + 4 = 260 events (defaults)
-```
-
-- The API never waits for queue space. `try_send` either admits the event or
-  returns `429`.
-- The dispatcher dequeues only when it has a free processing slot. A slot is
-  freed only after the dispatcher joins the finished task, so tasks never
-  exceed `worker_concurrency`.
-- This bounds the number of events held, not exact memory. Each event is
-  capped by the 64 KiB request limit plus fixed overhead.
-
-This is why an overloaded PulseStream answers `429` instead of building an
-unlimited in-memory backlog ([ADR-004](../adr/ADR-004-bounded-concurrency-backpressure.md)).
-
-### Acceptance and delivery semantics
-
-- **M1:** `202 Accepted` means *validated and admitted to the bounded
-  in-memory pipeline*. M1 acceptance is process-local and non-durable. A
-  process crash may lose accepted but unfinished events. There is no
-  deduplication, so a retried request becomes a new event.
-- **M2:** durable acceptance begins, and the delivery guarantee is documented
-  precisely ([ADR-005](../adr/ADR-005-delivery-semantics-deferred.md)).
-  PulseStream does not claim exactly-once processing.
-
-### Shutdown
-
-1. On SIGINT/SIGTERM, admission closes and new events get `503`.
-2. The HTTP server stops accepting connections and finishes in-flight requests.
-3. The queue receiver closes and buffered events drain.
-4. In-flight tasks finish.
-5. The drain is bounded by `PULSESTREAM_SHUTDOWN_TIMEOUT_MS`. On timeout, the
-   remaining tasks are aborted, abandoned counts are logged, and the process
-   exits with code 1.
+| Resource | Bound |
+| --- | --- |
+| API database connections | `PULSESTREAM_DB_MAX_CONNECTIONS` (default 10). Requests wait at most `PULSESTREAM_DB_ACQUIRE_TIMEOUT_MS` (default 3000), then get `503` |
+| Statement duration | `statement_timeout = 10s` on every connection |
+| Worker in-memory events | `PULSESTREAM_WORKER_CONCURRENCY` (default 4) per worker |
+| Durable backlog | Bounded by PostgreSQL storage only. Admission-side limits are planned for M4 |
 
 ## Operational plane
 
-- **Readiness (IMPLEMENTED).** `/health/ready` reports `processing`: `ready`
-  while events can be admitted, and `unavailable` with HTTP 503 once admission
-  is closed or the dispatcher has stopped. A database check is added when the
-  event path first uses PostgreSQL (M2).
-- **Lifecycle logs (IMPLEMENTED).** Each event logs admitted, processing
-  started, completed, or failed, with event ID, type, source, and state.
-  Queue-full rejections, drain start and complete, and drain timeout are also
-  logged. Payloads are never logged.
-- **Metrics (PLANNED, M4/M5).** Queue depth, in-flight work, retry and
-  dead-letter counts, latency distributions.
-- **Operations dashboard (PLANNED, M6).**
-- **Load and benchmark evidence (PLANNED, M4)** for any performance claim.
+- **Liveness (IMPLEMENTED).** `/health/live` returns `200` whenever the process
+  runs, including during a database outage.
+- **Readiness (IMPLEMENTED).** `/health/ready` runs `SELECT 1` with a 2 s
+  timeout. It returns `200` with `checks.database = "ready"`, or `503` with
+  `"unavailable"`. The pool validates connections before use, so readiness
+  recovers after a database restart without restarting the API.
+- **Lifecycle logs (IMPLEMENTED).** The logged events are: event persisted,
+  idempotency replay, idempotency conflict, event claimed, expired lease
+  reclaimed, event processed, claim lost, and database unavailable. Fields
+  include event ID, source, type, worker ID, and attempt. Payloads, raw
+  idempotency keys, and connection strings are never logged.
+- **Metrics (PLANNED, M4/M5)**, an **operations dashboard (PLANNED, M6)**, and
+  **load and benchmark evidence (PLANNED, M4)**.
 
 ## Architectural principles
 
-1. **Boundedness.** No unbounded queue, channel, or task-spawning loop. Every
-   buffer and concurrency limit has an explicit, configured capacity
-   ([ADR-004](../adr/ADR-004-bounded-concurrency-backpressure.md)).
-2. **Backpressure.** Overload produces explicit, observable behavior such as
-   rejection, not uncontrolled memory growth or silently rising latency.
-3. **Durability.** Once PulseStream acknowledges an event as durably accepted,
-   that event survives process failure. M1 acceptance is explicitly *not*
-   durable. Durable acceptance and its semantics arrive in M2.
-4. **Idempotency.** Producer retries must not cause unintended duplicate logical
-   processing. This is not yet implemented (M2).
-5. **Explicit delivery semantics.** No exactly-once claims. The delivery
-   guarantee will be stated precisely, including its failure cases.
-6. **Failure visibility.** Failures become observable states (retrying,
-   dead-lettered) rather than disappearing into logs. In M1, failures are
-   still log-only. Durable failure states arrive in M2 and M3.
-7. **Measured performance.** Performance claims require benchmark or load-test
-   evidence. Tuning changes (LTO, runtime thread counts, queue sizes) need data.
+1. **Boundedness.** No unbounded queue, channel, prefetch, or task-spawning
+   loop ([ADR-004](../adr/ADR-004-bounded-concurrency-backpressure.md)).
+2. **Backpressure.** Overload produces explicit behavior (`503` after a bounded
+   wait) rather than uncontrolled memory growth.
+3. **Durability.** `202` means committed. Accepted events survive process
+   failure ([ADR-007](../adr/ADR-007-postgresql-durable-admission-and-leases.md)).
+4. **Idempotency.** Producer retries with the same key never create a second
+   event. The database enforces this.
+5. **Explicit delivery semantics.** Durable admission with at-least-once
+   processing. No exactly-once claims.
+6. **Failure visibility.** Lifecycle state is persisted and queryable. M3 adds
+   explicit failed, retrying, and dead-letter states.
+7. **Measured performance.** No performance claims without benchmarks (M4).
 
 ## Process model
 
 ```text
-pulsestream-api ────┬──> pulsestream-worker (lib: bounded pipeline) ──┐
-                    └─────────────────────────────────────────────────┴──> pulsestream-core
-pulsestream-worker (bin) ──> pulsestream-core      (idle until M2)
+pulsestream-api ─────┐                      ┌── pulsestream-core (domain, config, idempotency)
+                     ├── pulsestream-store ─┤
+pulsestream-worker ──┘   (sqlx, migrations) └── PostgreSQL
 ```
 
-`pulsestream-core` has no HTTP, database, or runtime dependencies. Both
-binaries use Tokio's multi-threaded runtime with default settings, and log
-through `tracing` filtered by `RUST_LOG`. See
-[ADR-002](../adr/ADR-002-workspace-and-process-boundaries.md) for the process
-boundaries and [ADR-006](../adr/ADR-006-in-memory-bounded-admission.md) for why
-M1 runs the pipeline inside the API process.
+`pulsestream-core` has no HTTP, database, or runtime dependencies.
+`pulsestream-store` holds all SQL. Both binaries run migrations at startup by
+default (`PULSESTREAM_MIGRATE_ON_START`). The migrator takes an advisory lock,
+so concurrent startups are safe.

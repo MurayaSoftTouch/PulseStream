@@ -1,11 +1,12 @@
 //! Foundational PulseStream concepts shared by the API and worker processes.
 //!
 //! This crate deliberately contains no HTTP, runtime, or database code. It owns
-//! service identity, environment-based configuration parsing, and the validated
-//! event domain model.
+//! service identity, environment-based configuration parsing, the validated
+//! event domain model, and idempotency keys and request fingerprints.
 
 pub mod config;
 pub mod event;
+pub mod idempotency;
 
 use std::fmt;
 

@@ -1,12 +1,11 @@
 //! PulseStream event processing.
 //!
-//! In M1 the bounded in-memory [`pipeline`] runs inside the API process,
-//! because an in-memory queue cannot cross a process boundary. When durable
-//! acceptance arrives in M2, the standalone `pulsestream-worker` binary will
-//! consume events from PostgreSQL through the same bounded execution model
-//! (ADR-006).
+//! The [`runtime`] claims durably accepted events from PostgreSQL
+//! (`pulsestream-store`) and processes them with bounded concurrency and
+//! lease-based crash recovery (ADR-007). Processing is at-least-once.
 
-pub mod pipeline;
+pub mod processor;
+pub mod runtime;
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;

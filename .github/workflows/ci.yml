@@ -92,3 +92,46 @@ jobs:
 
       - name: cargo build
         run: cargo build --workspace --locked
+
+  postgres-integration:
+    name: postgres-integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        # Same major version as docker-compose.yml.
+        image: postgres:18.6-alpine
+        env:
+          # Disposable, CI-only credentials; not a secret.
+          POSTGRES_USER: pulsestream
+          POSTGRES_PASSWORD: ci_only_password
+          POSTGRES_DB: pulsestream_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pulsestream -d pulsestream_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      PULSESTREAM_TEST_DATABASE_URL: postgres://pulsestream:ci_only_password@127.0.0.1:5432/pulsestream_test
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install && rustup show
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-integration-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-integration-${{ runner.os }}-
+
+      # Each test creates a disposable database, applies the embedded
+      # migrations to it from empty, and drops it afterwards.
+      - name: PostgreSQL integration tests
+        run: cargo test --workspace --locked -- --ignored

@@ -3,13 +3,13 @@
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
-use pulsestream_worker::pipeline::Admission;
+use pulsestream_store::Store;
 
 use crate::{events, health};
 
 #[derive(Debug, Clone)]
 pub struct AppState {
-    pub admission: Admission,
+    pub store: Store,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -20,5 +20,6 @@ pub fn router(state: AppState) -> Router {
             "/v1/events",
             post(events::ingest).layer(DefaultBodyLimit::max(events::MAX_BODY_BYTES)),
         )
+        .route("/v1/events/{event_id}", get(events::get))
         .with_state(state)
 }

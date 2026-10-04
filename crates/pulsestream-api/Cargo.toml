@@ -1,6 +1,6 @@
 [package]
 name = "pulsestream-api"
-description = "PulseStream HTTP API process: event ingestion and health endpoints."
+description = "PulseStream HTTP API process: durable, idempotent event admission and status lookup."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,16 +10,17 @@ publish.workspace = true
 [dependencies]
 axum.workspace = true
 pulsestream-core.workspace = true
-pulsestream-worker.workspace = true
+pulsestream-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false }
-pulsestream-worker = { workspace = true, features = ["test-util"] }
+pulsestream-store = { workspace = true, features = ["test-util"] }
+pulsestream-worker.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
 tower.workspace = true
 

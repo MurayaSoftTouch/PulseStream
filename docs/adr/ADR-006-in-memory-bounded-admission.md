@@ -1,8 +1,12 @@
 # ADR-006: In-memory bounded admission semantics (M1)
 
-- Status: Accepted
+- Status: Superseded by [ADR-007](ADR-007-postgresql-durable-admission-and-leases.md) (M2)
 - Date: 2026-09-25
 - Milestone: M1
+
+> **Historical.** This records the M1 design. From M2, admission is durable in
+> PostgreSQL and the in-memory queue described here no longer exists. The
+> M1 boundedness principles carry over into ADR-007.
 
 ## Context
 

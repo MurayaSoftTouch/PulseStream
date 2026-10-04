@@ -1,13 +1,17 @@
 //! Stable API error responses: `{"code": "...", "message": "..."}`.
+//!
+//! Messages never include database errors, hostnames, connection strings, or
+//! framework internals.
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use pulsestream_core::idempotency::IdempotencyKeyError;
 use serde::Serialize;
 
-/// Seconds a client should wait before retrying after `QUEUE_FULL`.
-pub const QUEUE_FULL_RETRY_AFTER_SECS: u32 = 1;
+/// Seconds a client should wait before retrying after `PERSISTENCE_UNAVAILABLE`.
+pub const RETRY_AFTER_SECS: u32 = 1;
 
 // Keep the PAYLOAD_TOO_LARGE message in sync with the enforced limit.
 const _: () = assert!(crate::events::MAX_BODY_BYTES == 64 * 1024);
@@ -20,10 +24,20 @@ pub enum ApiError {
     PayloadTooLarge,
     /// 415: request is not `application/json`.
     UnsupportedMediaType,
-    /// 429: the admission queue is at capacity.
-    QueueFull,
-    /// 503: the pipeline is shutting down or has stopped.
-    ProcessingUnavailable,
+    /// 400: no `Idempotency-Key` header.
+    IdempotencyKeyRequired,
+    /// 400: `Idempotency-Key` fails validation.
+    IdempotencyKeyInvalid,
+    /// 409: the scoped key was already used for a different request.
+    IdempotencyConflict,
+    /// 400: the path is not a valid event ID.
+    InvalidEventId,
+    /// 404: no event with this ID.
+    EventNotFound,
+    /// 503: the database cannot durably accept or serve events right now.
+    PersistenceUnavailable,
+    /// 500: unexpected server-side failure. Details are logged, not returned.
+    Internal,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,16 +82,46 @@ impl ApiError {
                 "UNSUPPORTED_MEDIA_TYPE",
                 "Content-Type must be application/json",
             ),
-            Self::QueueFull => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "QUEUE_FULL",
-                "event admission capacity is temporarily exhausted",
+            Self::IdempotencyKeyRequired => (
+                StatusCode::BAD_REQUEST,
+                "IDEMPOTENCY_KEY_REQUIRED",
+                "Idempotency-Key header is required",
             ),
-            Self::ProcessingUnavailable => (
+            Self::IdempotencyKeyInvalid => (
+                StatusCode::BAD_REQUEST,
+                "IDEMPOTENCY_KEY_INVALID",
+                "Idempotency-Key must be 1-128 characters of visible ASCII (no spaces)",
+            ),
+            Self::IdempotencyConflict => (
+                StatusCode::CONFLICT,
+                "IDEMPOTENCY_CONFLICT",
+                "Idempotency-Key was already used for a different event from this source",
+            ),
+            Self::InvalidEventId => (
+                StatusCode::BAD_REQUEST,
+                "INVALID_EVENT_ID",
+                "event_id must be a UUID",
+            ),
+            Self::EventNotFound => (StatusCode::NOT_FOUND, "EVENT_NOT_FOUND", "event not found"),
+            Self::PersistenceUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "PROCESSING_UNAVAILABLE",
-                "event processing is temporarily unavailable",
+                "PERSISTENCE_UNAVAILABLE",
+                "event persistence is temporarily unavailable",
             ),
+            Self::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "internal server error",
+            ),
+        }
+    }
+}
+
+impl From<IdempotencyKeyError> for ApiError {
+    fn from(err: IdempotencyKeyError) -> Self {
+        match err {
+            IdempotencyKeyError::Missing => Self::IdempotencyKeyRequired,
+            IdempotencyKeyError::Invalid => Self::IdempotencyKeyInvalid,
         }
     }
 }
@@ -86,11 +130,10 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = self.parts();
         let mut response = (status, Json(ErrorBody { code, message })).into_response();
-        if self == Self::QueueFull {
-            response.headers_mut().insert(
-                header::RETRY_AFTER,
-                HeaderValue::from(QUEUE_FULL_RETRY_AFTER_SECS),
-            );
+        if self == Self::PersistenceUnavailable {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECS));
         }
         response
     }
