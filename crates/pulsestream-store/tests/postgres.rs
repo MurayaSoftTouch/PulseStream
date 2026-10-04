@@ -520,7 +520,10 @@ async fn retryable_failure_schedules_a_future_retry_that_is_claimed_only_when_du
     assert_eq!(db.store.claim(a, 1, LEASE, MAX).await.unwrap().len(), 1);
 
     // 1-2. A retryable failure makes the event PENDING again, in the future.
-    let delay = Duration::from_millis(400);
+    // The store applies the delay it is given (jitter is the worker's
+    // concern), so the persisted delay must be exactly this. 2 s leaves a
+    // wide margin for the "not yet claimable" poll below on a loaded host.
+    let delay = Duration::from_secs(2);
     let available_at = db
         .store
         .schedule_retry(id, a, delay, &failure("UPSTREAM_TIMEOUT"))
@@ -537,10 +540,18 @@ async fn retryable_failure_schedules_a_future_retry_that_is_claimed_only_when_du
         ),
         ("PENDING", None, None)
     );
-    // 3. `available_at` is in the future (database clock), by about `delay`.
+    // 3. `available_at` is scheduled in the future relative to the database
+    // `now()` that recorded the failure, by exactly `delay`. This compares
+    // two persisted timestamps, so host scheduling delays cannot affect it.
     let state = db.failure(id).await;
+    let scheduled = state.scheduled_delay_ms.expect("failure recorded");
     assert!(
-        (200.0..=400.0).contains(&state.available_in_ms),
+        (scheduled - 2_000.0).abs() < 0.01,
+        "persisted delay {scheduled} ms, expected 2000 ms"
+    );
+    // Seen from now, it is still in the future and never beyond the delay.
+    assert!(
+        state.available_in_ms > 0.0 && state.available_in_ms <= 2_000.0,
         "available in {} ms",
         state.available_in_ms
     );
@@ -551,9 +562,10 @@ async fn retryable_failure_schedules_a_future_retry_that_is_claimed_only_when_du
     // 4. A poll before eligibility claims nothing.
     let b = WorkerId::new();
     assert!(db.store.claim(b, 10, LEASE, MAX).await.unwrap().is_empty());
+    assert_eq!(db.lifecycle(id).await.attempts, 1, "no claim consumed");
 
     // 5. Once due (real time passes on the database clock), it is claimed.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let claimed = loop {
         let batch = db.store.claim(b, 10, LEASE, MAX).await.unwrap();
         if !batch.is_empty() {

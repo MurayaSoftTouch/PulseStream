@@ -917,6 +917,7 @@ mod tests {
         let mut slow_retry = retry_config(1, 5);
         slow_retry.retry =
             RetryPolicy::new(5, Duration::from_secs(60), Duration::from_secs(60)).unwrap();
+        let policy = slow_retry.retry;
         let handle = start(
             db.store.clone(),
             WorkerId::new(),
@@ -935,8 +936,17 @@ mod tests {
         }
         assert_eq!(db.lifecycle(ids[0]).await.status, "PENDING");
         let failure = db.failure(ids[0]).await;
+        // The persisted delay is exactly the policy's deterministic delay for
+        // (event, attempt 1): 60 s scaled by jitter into [80%, 100%].
+        let scheduled = failure.scheduled_delay_ms.expect("failure recorded");
+        let expected = policy.delay(ids[0], 1).as_secs_f64() * 1000.0;
         assert!(
-            failure.available_in_ms > 40_000.0,
+            (scheduled - expected).abs() < 0.01,
+            "persisted delay {scheduled} ms, policy delay {expected} ms"
+        );
+        assert!((48_000.0..=60_000.0).contains(&scheduled), "{scheduled} ms");
+        assert!(
+            failure.available_in_ms > 0.0,
             "retry scheduled in the future: {failure:?}"
         );
         tokio::time::sleep(Duration::from_millis(200)).await; // ~20 polls
