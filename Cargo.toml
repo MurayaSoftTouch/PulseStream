@@ -11,7 +11,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
-repository = "https://github.com/Ngetich-86/PulseStream"
+repository = "https://github.com/MurayaSoftTouch/PulseStream"
 publish = false
 
 [workspace.dependencies]
