@@ -94,18 +94,25 @@ impl fmt::Display for WorkerId {
     }
 }
 
-/// Durable lifecycle state of an event (M2).
+/// Durable lifecycle state of an event (ADR-007, ADR-008).
 ///
 /// ```text
-/// PENDING ──claim──▶ PROCESSING ──complete (owner only)──▶ PROCESSED
-///                        │
-///                        └── lease expires ──▶ reclaimable by any worker
+/// PENDING (available_at <= now) ──claim──▶ PROCESSING ──success (owner only)──▶ PROCESSED
+///    ▲                                       │
+///    └──── retryable failure, attempts left ─┤
+///          (available_at = now + backoff)    ├── permanent failure ───────▶ DEAD_LETTERED
+///                                            ├── retryable, budget spent ─▶ DEAD_LETTERED
+///                                            └── lease expires ──▶ reclaimable by any worker
+///                                                (on the final attempt ──▶ DEAD_LETTERED)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventStatus {
     Pending,
     Processing,
     Processed,
+    /// Terminal: never claimed again. The row, its content, its attempt count,
+    /// and its final failure metadata are kept.
+    DeadLettered,
 }
 
 impl EventStatus {
@@ -115,6 +122,7 @@ impl EventStatus {
             Self::Pending => "PENDING",
             Self::Processing => "PROCESSING",
             Self::Processed => "PROCESSED",
+            Self::DeadLettered => "DEAD_LETTERED",
         }
     }
 
@@ -123,6 +131,7 @@ impl EventStatus {
             "PENDING" => Some(Self::Pending),
             "PROCESSING" => Some(Self::Processing),
             "PROCESSED" => Some(Self::Processed),
+            "DEAD_LETTERED" => Some(Self::DeadLettered),
             _ => None,
         }
     }
@@ -133,6 +142,7 @@ impl EventStatus {
             Self::Pending => "pending",
             Self::Processing => "processing",
             Self::Processed => "processed",
+            Self::DeadLettered => "dead_lettered",
         }
     }
 }
@@ -284,12 +294,15 @@ mod tests {
             EventStatus::Pending,
             EventStatus::Processing,
             EventStatus::Processed,
+            EventStatus::DeadLettered,
         ] {
             assert_eq!(EventStatus::from_db_str(status.as_db_str()), Some(status));
         }
         assert_eq!(EventStatus::Pending.as_api_str(), "pending");
         assert_eq!(EventStatus::Processing.as_api_str(), "processing");
         assert_eq!(EventStatus::Processed.as_api_str(), "processed");
+        assert_eq!(EventStatus::DeadLettered.as_db_str(), "DEAD_LETTERED");
+        assert_eq!(EventStatus::DeadLettered.as_api_str(), "dead_lettered");
         assert_eq!(EventStatus::from_db_str("RETRYING"), None);
     }
 

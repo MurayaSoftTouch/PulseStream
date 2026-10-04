@@ -130,6 +130,62 @@ impl TestDatabase {
         assert_eq!(updated.rows_affected(), 1, "event {id} was not PROCESSING");
     }
 
+    /// Simulates the passage of a scheduled retry's delay without sleeping:
+    /// moves the `available_at` of a PENDING event into the past.
+    pub async fn make_available(&self, id: EventId) {
+        let updated = sqlx::query(
+            "UPDATE events SET available_at = now() - interval '1 millisecond' \
+             WHERE event_id = $1 AND status = 'PENDING'",
+        )
+        .bind(id.as_uuid())
+        .execute(self.store.pool())
+        .await
+        .expect("make available");
+        assert_eq!(updated.rows_affected(), 1, "event {id} was not PENDING");
+    }
+
+    /// Retry and failure columns, for assertions.
+    pub async fn failure(&self, id: EventId) -> FailureState {
+        type Row = (Option<String>, Option<String>, bool, bool, bool, f64, bool);
+        let (
+            code,
+            message,
+            failed,
+            dead_lettered,
+            processed,
+            available_in_ms,
+            available_at_is_accepted_at,
+        ): Row = sqlx::query_as(
+            "SELECT last_failure_code, last_failure_message, last_failed_at IS NOT NULL, \
+                        dead_lettered_at IS NOT NULL, processed_at IS NOT NULL, \
+                        (extract(epoch FROM available_at - now()) * 1000)::float8, \
+                        available_at = accepted_at \
+                 FROM events WHERE event_id = $1",
+        )
+        .bind(id.as_uuid())
+        .fetch_one(self.store.pool())
+        .await
+        .expect("event row exists");
+        FailureState {
+            code,
+            message,
+            failed,
+            dead_lettered,
+            processed,
+            available_in_ms,
+            available_at_is_accepted_at,
+        }
+    }
+
+    /// Number of events with `status`.
+    pub async fn count_with_status(&self, status: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE status = $1")
+            .bind(status)
+            .fetch_one(self.store.pool())
+            .await
+            .expect("count")
+    }
+
     /// Raw lifecycle columns, for assertions.
     pub async fn lifecycle(&self, id: EventId) -> Lifecycle {
         let (status, owner, attempts, lease_active): (String, Option<Uuid>, i32, Option<bool>) =
@@ -205,6 +261,23 @@ pub struct Lifecycle {
     pub attempts: i32,
     /// `None` when no lease is set.
     pub lease_active: Option<bool>,
+}
+
+/// Retry and failure columns of one event row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailureState {
+    pub code: Option<String>,
+    pub message: Option<String>,
+    /// `last_failed_at` is set.
+    pub failed: bool,
+    /// `dead_lettered_at` is set.
+    pub dead_lettered: bool,
+    /// `processed_at` is set.
+    pub processed: bool,
+    /// `available_at - now()` in milliseconds (database clock). Negative once
+    /// the event is eligible.
+    pub available_in_ms: f64,
+    pub available_at_is_accepted_at: bool,
 }
 
 /// A TCP proxy in front of PostgreSQL that can simulate an outage and a

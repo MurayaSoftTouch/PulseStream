@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use crate::retry::{RetryPolicy, RetryPolicyError};
+
 pub const API_BIND_VAR: &str = "PULSESTREAM_API_BIND";
 pub const DATABASE_URL_VAR: &str = "DATABASE_URL";
 pub const DB_MAX_CONNECTIONS_VAR: &str = "PULSESTREAM_DB_MAX_CONNECTIONS";
@@ -20,6 +22,9 @@ pub const WORKER_CONCURRENCY_VAR: &str = "PULSESTREAM_WORKER_CONCURRENCY";
 pub const POLL_INTERVAL_MS_VAR: &str = "PULSESTREAM_POLL_INTERVAL_MS";
 pub const PROCESSING_LEASE_MS_VAR: &str = "PULSESTREAM_PROCESSING_LEASE_MS";
 pub const SHUTDOWN_TIMEOUT_MS_VAR: &str = "PULSESTREAM_SHUTDOWN_TIMEOUT_MS";
+pub const MAX_DELIVERY_ATTEMPTS_VAR: &str = "PULSESTREAM_MAX_DELIVERY_ATTEMPTS";
+pub const RETRY_BASE_DELAY_MS_VAR: &str = "PULSESTREAM_RETRY_BASE_DELAY_MS";
+pub const RETRY_MAX_DELAY_MS_VAR: &str = "PULSESTREAM_RETRY_MAX_DELAY_MS";
 
 /// Loopback-only default so an unconfigured process is never exposed publicly.
 pub const DEFAULT_API_BIND: &str = "127.0.0.1:8088";
@@ -36,6 +41,14 @@ pub const DEFAULT_PROCESSING_LEASE_MS: u64 = 30_000;
 pub const PROCESSING_LEASE_MS_RANGE: RangeInclusive<u64> = 1_000..=3_600_000;
 pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
 pub const SHUTDOWN_TIMEOUT_MS_RANGE: RangeInclusive<u64> = 1..=300_000;
+pub const DEFAULT_MAX_DELIVERY_ATTEMPTS: u32 = 5;
+pub const MAX_DELIVERY_ATTEMPTS_RANGE: RangeInclusive<u64> = 1..=100;
+pub const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 1_000;
+/// Up to 10 minutes.
+pub const RETRY_BASE_DELAY_MS_RANGE: RangeInclusive<u64> = 1..=600_000;
+pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 60_000;
+/// Up to 24 hours.
+pub const RETRY_MAX_DELAY_MS_RANGE: RangeInclusive<u64> = 1..=86_400_000;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
@@ -64,6 +77,9 @@ pub enum ConfigError {
 
     #[error("{var} must be `true` or `false`, got {value:?}")]
     InvalidBool { var: &'static str, value: String },
+
+    #[error("invalid retry policy: {0}")]
+    InvalidRetryPolicy(#[from] RetryPolicyError),
 }
 
 /// A validated PostgreSQL connection URL.
@@ -219,6 +235,8 @@ pub struct WorkerRuntimeConfig {
     pub lease: Duration,
     /// How long shutdown waits for active processing to finish.
     pub shutdown_timeout: Duration,
+    /// Attempt limit and backoff for failed processing (ADR-008).
+    pub retry: RetryPolicy,
 }
 
 impl WorkerRuntimeConfig {
@@ -249,8 +267,43 @@ impl WorkerRuntimeConfig {
                 DEFAULT_SHUTDOWN_TIMEOUT_MS,
                 SHUTDOWN_TIMEOUT_MS_RANGE,
             )?,
+            retry: retry_policy(lookup)?,
         })
     }
+}
+
+/// Reads the retry variables. Each must be in range, and the maximum delay
+/// must not be below the base delay; nothing is silently adjusted.
+fn retry_policy(lookup: &impl Fn(&str) -> Option<String>) -> Result<RetryPolicy, ConfigError> {
+    let max_attempts = bounded_integer(
+        lookup,
+        MAX_DELIVERY_ATTEMPTS_VAR,
+        u64::from(DEFAULT_MAX_DELIVERY_ATTEMPTS),
+        MAX_DELIVERY_ATTEMPTS_RANGE,
+    )? as u32;
+    let base = millis(
+        lookup,
+        RETRY_BASE_DELAY_MS_VAR,
+        DEFAULT_RETRY_BASE_DELAY_MS,
+        RETRY_BASE_DELAY_MS_RANGE,
+    )?;
+    let max = millis(
+        lookup,
+        RETRY_MAX_DELAY_MS_VAR,
+        DEFAULT_RETRY_MAX_DELAY_MS,
+        RETRY_MAX_DELAY_MS_RANGE,
+    )?;
+    Ok(RetryPolicy::new(max_attempts, base, max)?)
+}
+
+/// The default retry policy: 5 attempts, 1 s base delay, 60 s maximum delay.
+pub fn default_retry_policy() -> RetryPolicy {
+    RetryPolicy::new(
+        DEFAULT_MAX_DELIVERY_ATTEMPTS,
+        Duration::from_millis(DEFAULT_RETRY_BASE_DELAY_MS),
+        Duration::from_millis(DEFAULT_RETRY_MAX_DELAY_MS),
+    )
+    .expect("default retry policy is valid")
 }
 
 impl Default for WorkerRuntimeConfig {
@@ -260,6 +313,7 @@ impl Default for WorkerRuntimeConfig {
             poll_interval: Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
             lease: Duration::from_millis(DEFAULT_PROCESSING_LEASE_MS),
             shutdown_timeout: Duration::from_millis(DEFAULT_SHUTDOWN_TIMEOUT_MS),
+            retry: default_retry_policy(),
         }
     }
 }
@@ -355,6 +409,9 @@ mod tests {
         assert_eq!(runtime.poll_interval, Duration::from_millis(250));
         assert_eq!(runtime.lease, Duration::from_secs(30));
         assert_eq!(runtime.shutdown_timeout, Duration::from_secs(10));
+        assert_eq!(runtime.retry.max_delivery_attempts(), 5);
+        assert_eq!(runtime.retry.base_delay(), Duration::from_secs(1));
+        assert_eq!(runtime.retry.max_delay(), Duration::from_secs(60));
     }
 
     #[test]
@@ -404,6 +461,9 @@ mod tests {
             (POLL_INTERVAL_MS_VAR, "60000"),
             (PROCESSING_LEASE_MS_VAR, " 1000 "),
             (SHUTDOWN_TIMEOUT_MS_VAR, "300000"),
+            (MAX_DELIVERY_ATTEMPTS_VAR, "100"),
+            (RETRY_BASE_DELAY_MS_VAR, "600000"),
+            (RETRY_MAX_DELAY_MS_VAR, "86400000"),
         ])
         .unwrap();
         assert_eq!(cfg.database.max_connections, 50);
@@ -413,6 +473,18 @@ mod tests {
         assert_eq!(cfg.runtime.poll_interval, Duration::from_secs(60));
         assert_eq!(cfg.runtime.lease, Duration::from_secs(1));
         assert_eq!(cfg.runtime.shutdown_timeout, Duration::from_secs(300));
+        assert_eq!(cfg.runtime.retry.max_delivery_attempts(), 100);
+        assert_eq!(cfg.runtime.retry.base_delay(), Duration::from_secs(600));
+        assert_eq!(cfg.runtime.retry.max_delay(), Duration::from_secs(86_400));
+
+        let minimal = worker(&[
+            (MAX_DELIVERY_ATTEMPTS_VAR, "1"),
+            (RETRY_BASE_DELAY_MS_VAR, "1"),
+            (RETRY_MAX_DELAY_MS_VAR, "1"),
+        ])
+        .unwrap();
+        assert_eq!(minimal.runtime.retry.max_delivery_attempts(), 1);
+        assert_eq!(minimal.runtime.retry.max_delay(), Duration::from_millis(1));
     }
 
     #[test]
@@ -430,6 +502,12 @@ mod tests {
             (SHUTDOWN_TIMEOUT_MS_VAR, "0"),
             (SHUTDOWN_TIMEOUT_MS_VAR, "-1"),
             (SHUTDOWN_TIMEOUT_MS_VAR, ""),
+            (MAX_DELIVERY_ATTEMPTS_VAR, "0"),
+            (MAX_DELIVERY_ATTEMPTS_VAR, "101"),
+            (RETRY_BASE_DELAY_MS_VAR, "0"),
+            (RETRY_BASE_DELAY_MS_VAR, "600001"),
+            (RETRY_MAX_DELAY_MS_VAR, "0"),
+            (RETRY_MAX_DELAY_MS_VAR, "86400001"),
         ];
         for (var, value) in cases {
             let err = worker(&[(var, value)]).unwrap_err();
@@ -438,6 +516,26 @@ mod tests {
                 "{var}={value:?} -> {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_max_retry_delay_below_base() {
+        let err = worker(&[
+            (RETRY_BASE_DELAY_MS_VAR, "5000"),
+            (RETRY_MAX_DELAY_MS_VAR, "4999"),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidRetryPolicy(RetryPolicyError::MaxBelowBase {
+                base: Duration::from_millis(5000),
+                max: Duration::from_millis(4999),
+            })
+        );
+        // The default maximum (60 s) is below a 10-minute base: also rejected,
+        // never silently raised.
+        let err = worker(&[(RETRY_BASE_DELAY_MS_VAR, "600000")]).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidRetryPolicy(_)), "{err:?}");
     }
 
     #[test]

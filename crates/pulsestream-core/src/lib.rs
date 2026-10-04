@@ -2,11 +2,14 @@
 //!
 //! This crate deliberately contains no HTTP, runtime, or database code. It owns
 //! service identity, environment-based configuration parsing, the validated
-//! event domain model, and idempotency keys and request fingerprints.
+//! event domain model, idempotency keys and request fingerprints, structured
+//! processing failures, and the retry policy.
 
 pub mod config;
 pub mod event;
+pub mod failure;
 pub mod idempotency;
+pub mod retry;
 
 use std::fmt;
 
