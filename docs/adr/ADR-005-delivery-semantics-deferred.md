@@ -1,6 +1,6 @@
 # ADR-005: Delivery semantics deferred until durable pipeline design
 
-- Status: Accepted
+- Status: Superseded by [ADR-007](ADR-007-postgresql-durable-admission-and-leases.md) (M2), which defines durable admission with at-least-once processing
 - Date: 2026-09-25
 - Milestone: M0
 
