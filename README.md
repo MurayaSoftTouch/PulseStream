@@ -1,9 +1,14 @@
 # PulseStream
 
-A Rust event processing platform being built for bounded concurrency,
-idempotency, retries, recovery, and observability.
+[![CI](https://github.com/MurayaSoftTouch/PulseStream/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MurayaSoftTouch/PulseStream/actions/workflows/ci.yml)
 
-> **Status: Milestone 3 (Retry, dead-letter, and failure handling).**
+A Rust event-processing service with durable PostgreSQL admission, idempotent
+ingestion, lease-based concurrent workers, retries with backoff, and
+dead-lettering. Metrics and broader observability are planned, not built.
+
+> **Status: in active development.** Milestones 0–3 are merged; M3 (retry,
+> dead-letter, and failure handling) is the latest. Next is M4: benchmarks,
+> load tests, and admission backpressure. See the [roadmap](docs/backlog/roadmap.md).
 >
 > **PulseStream provides durable admission with at-least-once processing.**
 > `202 Accepted` means the event has been committed to PostgreSQL, so it
@@ -25,7 +30,7 @@ idempotency, retries, recovery, and observability.
 | Failures | Processors return **retryable** or **permanent** failures with a stable code. Retryable failures back off exponentially (deterministic jitter, capped). After the maximum attempts, or on a permanent failure, the event is **dead-lettered** in PostgreSQL with safe failure metadata | Authenticated dead-letter inspection and redrive (M5/M6) |
 | Recovery | An expired lease is reclaimed by any worker, without backoff. An expired lease on the final permitted attempt is dead-lettered (`LEASE_EXPIRED`). Stale owners cannot complete, retry, or dead-letter reclaimed events | |
 | Delivery semantics | **Durable admission, at-least-once processing.** No exactly-once claim | |
-| Observability | Structured lifecycle logs. Readiness checks the database | Metrics (M4/M5), dashboard (M6) |
+| Observability | Structured lifecycle logs. Readiness checks the database | Metrics (M5), dashboard (M6) |
 | Security | No authentication or authorization | M5 |
 | Performance | **Not benchmarked. No performance claims** | Benchmarks and load tests (M4) |
 
@@ -33,10 +38,22 @@ idempotency, retries, recovery, and observability.
 
 ```text
 Client ─▶ API ─(one transaction, 202 after COMMIT)─▶ PostgreSQL events ─(SKIP LOCKED claim of due events)─▶ bounded workers
-                                                                                                          ├─▶ PROCESSED
-                                                                                                          ├─▶ retryable → PENDING + available_at (backoff)
-                                                                                                          ├─▶ permanent / exhausted → DEAD_LETTERED
-                                                                                                          └─▶ lease expiry → reclaim
+```
+
+Event lifecycle, as enforced by the `events` table's status and lifecycle
+CHECK constraints and the owner-checked store operations:
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: POST /v1/events (202 after COMMIT)
+    PENDING --> PROCESSING: claim when due (SKIP LOCKED, lease, attempt +1)
+    PROCESSING --> PROCESSED: processor succeeds
+    PROCESSING --> PENDING: retryable failure, attempts left (available_at = now + backoff)
+    PROCESSING --> DEAD_LETTERED: permanent failure, or retries exhausted
+    PROCESSING --> PROCESSING: lease expired, reclaimed by another worker (no backoff)
+    PROCESSING --> DEAD_LETTERED: lease expired on the final attempt (LEASE_EXPIRED)
+    PROCESSED --> [*]
+    DEAD_LETTERED --> [*]
 ```
 
 | Crate | Kind | Responsibility |
